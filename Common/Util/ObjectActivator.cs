@@ -19,7 +19,7 @@ using System.Linq;
 using System.Linq.Expressions;
 using CloneExtensions;
 using Fasterflect;
-using QuantConnect.Securities;
+using QuantConnect.Logging;
 
 namespace QuantConnect.Util
 {
@@ -122,6 +122,31 @@ namespace QuantConnect.Util
                 throw new Exception("Unable to clone instance of type " + instanceToClone.GetType().Name + " to " + typeof(T).Name);
             }
             return clone;
+        }
+
+        /// <summary>
+        /// Adds method to return an instance of object
+        /// </summary>
+        /// <param name="key">The key of the method to add</param>
+        /// <param name="value">The value of the method to add</param>
+        public static void AddActivator(Type key, Func<object[], object> value)
+        {
+            if (!_activatorsByType.ContainsKey(key))
+            {
+                _activatorsByType.Add(key, value);
+            }
+            else
+            {
+                throw new ArgumentException($"ObjectActivator.AddActivator(): a method to return an instance of {key.Name} has already been added");
+            }
+        }
+
+        /// <summary>
+        /// Reset the object activators
+        /// </summary>
+        public static void ResetActivators()
+        {
+            _activatorsByType.Clear();
         }
     }
 }

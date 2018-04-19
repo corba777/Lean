@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,15 +18,16 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using QuantConnect.Data.Market;
+using QuantConnect.Interfaces;
 using QuantConnect.Orders;
 
-namespace QuantConnect.Securities 
+namespace QuantConnect.Securities
 {
     /// <summary>
     /// Portfolio manager class groups popular properties and makes them accessible through one interface.
     /// It also provide indexing by the vehicle symbol to get the Security.Holding objects.
     /// </summary>
-    public class SecurityPortfolioManager : IDictionary<Symbol, SecurityHolding>, ISecurityProvider 
+    public class SecurityPortfolioManager : IDictionary<Symbol, SecurityHolding>, ISecurityProvider
     {
         /// <summary>
         /// Local access to the securities collection for the portfolio summation.
@@ -63,11 +64,11 @@ namespace QuantConnect.Securities
         /// <summary>
         /// Initialise security portfolio manager.
         /// </summary>
-        public SecurityPortfolioManager(SecurityManager securityManager, SecurityTransactionManager transactions) 
+        public SecurityPortfolioManager(SecurityManager securityManager, SecurityTransactionManager transactions, IOrderProperties defaultOrderProperties = null)
         {
             Securities = securityManager;
             Transactions = transactions;
-            MarginCallModel = new MarginCallModel(this);
+            MarginCallModel = new DefaultMarginCallModel(this, defaultOrderProperties);
 
             CashBook = new CashBook();
             UnsettledCashBook = new CashBook();
@@ -207,8 +208,8 @@ namespace QuantConnect.Securities
         {
             get
             {
-                return (from asset in Securities.Values
-                        select asset.Holdings).ToList();
+                return (from kvp in Securities
+                        select kvp.Value.Holdings).ToList();
             }
         }
 
@@ -282,13 +283,13 @@ namespace QuantConnect.Securities
             get
             {
                 //Sum of unlevered cost of holdings
-                return (from position in Securities.Values
-                        select position.Holdings.UnleveredAbsoluteHoldingsCost).Sum();
+                return (from kvp in Securities
+                        select kvp.Value.Holdings.UnleveredAbsoluteHoldingsCost).Sum();
             }
         }
 
         /// <summary>
-        /// Gets the total absolute holdings cost of the portfolio. This sums up the individual 
+        /// Gets the total absolute holdings cost of the portfolio. This sums up the individual
         /// absolute cost of each holding
         /// </summary>
         public decimal TotalAbsoluteHoldingsCost
@@ -304,8 +305,8 @@ namespace QuantConnect.Securities
             get
             {
                 //Sum sum of holdings
-                return (from position in Securities.Values
-                        select position.Holdings.AbsoluteHoldingsValue).Sum();
+                return (from kvp in Securities
+                        select kvp.Value.Holdings.AbsoluteHoldingsValue).Sum();
             }
         }
 
@@ -331,12 +332,12 @@ namespace QuantConnect.Securities
         /// <summary>
         /// Get the total unrealised profit in our portfolio from the individual security unrealized profits.
         /// </summary>
-        public decimal TotalUnrealisedProfit 
+        public decimal TotalUnrealisedProfit
         {
             get
             {
-                return (from position in Securities.Values
-                        select position.Holdings.UnrealizedProfit).Sum();
+                return (from kvp in Securities
+                        select kvp.Value.Holdings.UnrealizedProfit).Sum();
             }
         }
 
@@ -361,50 +362,55 @@ namespace QuantConnect.Securities
             get
             {
                 // we can't include forex in this calculation since we would be double accounting with respect to the cash book
-                decimal totalHoldingsValueWithoutForex = 0;
+                // we exclude futures as they are calculated separately
+                decimal totalHoldingsValueWithoutForexAndCrypto = 0;
                 foreach (var kvp in Securities)
                 {
                     var position = kvp.Value;
-                    if (position.Type != SecurityType.Forex) totalHoldingsValueWithoutForex += position.Holdings.HoldingsValue;
+                    if (position.Type != SecurityType.Forex && position.Type != SecurityType.Crypto &&
+                        position.Type != SecurityType.Future) totalHoldingsValueWithoutForexAndCrypto += position.Holdings.HoldingsValue;
                 }
 
-                return CashBook.TotalValueInAccountCurrency + UnsettledCashBook.TotalValueInAccountCurrency + totalHoldingsValueWithoutForex;
+                var totalFuturesHoldingsValue = Securities.Where(x => x.Value.Type == SecurityType.Future)
+                                                           .Sum(x => x.Value.Holdings.UnrealizedProfit);
+
+                return CashBook.TotalValueInAccountCurrency + UnsettledCashBook.TotalValueInAccountCurrency + totalHoldingsValueWithoutForexAndCrypto + totalFuturesHoldingsValue;
             }
         }
 
         /// <summary>
         /// Total fees paid during the algorithm operation across all securities in portfolio.
         /// </summary>
-        public decimal TotalFees 
+        public decimal TotalFees
         {
-            get 
+            get
             {
-                return (from position in Securities.Values
-                        select position.Holdings.TotalFees).Sum();
+                return (from kvp in Securities
+                        select kvp.Value.Holdings.TotalFees).Sum();
             }
         }
 
         /// <summary>
         /// Sum of all gross profit across all securities in portfolio.
         /// </summary>
-        public decimal TotalProfit 
+        public decimal TotalProfit
         {
-            get 
+            get
             {
-                return (from position in Securities.Values
-                        select position.Holdings.Profit).Sum();
+                return (from kvp in Securities
+                        select kvp.Value.Holdings.Profit).Sum();
             }
         }
 
         /// <summary>
         /// Total sale volume since the start of algorithm operations.
         /// </summary>
-        public decimal TotalSaleVolume 
+        public decimal TotalSaleVolume
         {
-            get 
+            get
             {
-                return (from position in Securities.Values
-                        select position.Holdings.TotalSaleVolume).Sum();
+                return (from kvp in Securities
+                        select kvp.Value.Holdings.TotalSaleVolume).Sum();
             }
         }
 
@@ -419,7 +425,8 @@ namespace QuantConnect.Securities
                 foreach (var kvp in Securities)
                 {
                     var security = kvp.Value;
-                    sum += security.MarginModel.GetMaintenanceMargin(security);
+
+                    sum += security.BuyingPowerModel.GetReservedBuyingPowerForPosition(security);
                 }
                 return sum;
             }
@@ -437,7 +444,7 @@ namespace QuantConnect.Securities
         /// Gets or sets the <see cref="MarginCallModel"/> for the portfolio. This
         /// is used to executed margin call orders.
         /// </summary>
-        public MarginCallModel MarginCallModel { get; set; }
+        public IMarginCallModel MarginCallModel { get; set; }
 
         /// <summary>
         /// Indexer for the PortfolioManager class to access the underlying security holdings objects.
@@ -465,7 +472,7 @@ namespace QuantConnect.Securities
         /// Set the base currrency cash this algorithm is to manage.
         /// </summary>
         /// <param name="cash">Decimal cash value of portfolio</param>
-        public void SetCash(decimal cash) 
+        public void SetCash(decimal cash)
         {
             _baseCurrencyCash.SetAmount(cash);
         }
@@ -499,7 +506,7 @@ namespace QuantConnect.Securities
         public decimal GetMarginRemaining(Symbol symbol, OrderDirection direction = OrderDirection.Buy)
         {
             var security = Securities[symbol];
-            return security.MarginModel.GetMarginRemaining(this, security, direction);
+            return security.BuyingPowerModel.GetBuyingPower(this, security, direction);
         }
 
         /// <summary>
@@ -515,7 +522,7 @@ namespace QuantConnect.Securities
         }
 
         /// <summary>
-        /// Calculate the new average price after processing a partial/complete order fill event. 
+        /// Calculate the new average price after processing a partial/complete order fill event.
         /// </summary>
         /// <remarks>
         ///     For purchasing stocks from zero holdings, the new average price is the sale price.
@@ -526,62 +533,6 @@ namespace QuantConnect.Securities
         {
             var security = Securities[fill.Symbol];
             security.PortfolioModel.ProcessFill(this, security, fill);
-        }
-
-        /// <summary>
-        /// Scan the portfolio and the updated data for a potential margin call situation which may get the holdings below zero! 
-        /// If there is a margin call, liquidate the portfolio immediately before the portfolio gets sub zero.
-        /// </summary>
-        /// <param name="issueMarginCallWarning">Set to true if a warning should be issued to the algorithm</param>
-        /// <returns>True for a margin call on the holdings.</returns>
-        public List<SubmitOrderRequest> ScanForMarginCall(out bool issueMarginCallWarning)
-        {
-            issueMarginCallWarning = false;
-
-            var totalMarginUsed = TotalMarginUsed;
-
-            // don't issue a margin call if we're not using margin
-            if (totalMarginUsed <= 0)
-            {
-                return new List<SubmitOrderRequest>();
-            }
-
-            // don't issue a margin call if we're under 1x implied leverage on the whole portfolio's holdings
-            var averageHoldingsLeverage = TotalAbsoluteHoldingsCost/totalMarginUsed;
-            if (averageHoldingsLeverage <= 1.0m)
-            {
-                return new List<SubmitOrderRequest>();
-            }
-
-            var marginRemaining = MarginRemaining;
-
-            // issue a margin warning when we're down to 5% margin remaining
-            var totalPortfolioValue = TotalPortfolioValue;
-            if (marginRemaining <= totalPortfolioValue*0.05m)
-            {
-                issueMarginCallWarning = true;
-            }
-
-            // if we still have margin remaining then there's no need for a margin call
-            if (marginRemaining > 0)
-            {
-                return new List<SubmitOrderRequest>();
-            }
-
-            // generate a listing of margin call orders
-            var marginCallOrders = new List<SubmitOrderRequest>();
-
-            // skip securities that have no price data or no holdings, we can't liquidate nothingness
-            foreach (var security in Securities.Values.Where(x => x.Holdings.Quantity != 0 && x.Price != 0))
-            {
-                var marginCallOrder = security.MarginModel.GenerateMarginCallOrder(security, totalPortfolioValue, totalMarginUsed);
-                if (marginCallOrder != null && marginCallOrder.Quantity != 0)
-                {
-                    marginCallOrders.Add(marginCallOrder);
-                }
-            }
-
-            return marginCallOrders;
         }
 
         /// <summary>
@@ -612,7 +563,13 @@ namespace QuantConnect.Securities
         {
             var security = Securities[split.Symbol];
 
-            // only apply splits in raw data mode, 
+            // only apply splits to equities
+            if (security.Type != SecurityType.Equity)
+            {
+                return;
+            }
+
+            // only apply splits in raw data mode,
             var mode = security.DataNormalizationMode;
             if (mode != DataNormalizationMode.Raw)
             {
@@ -620,15 +577,15 @@ namespace QuantConnect.Securities
             }
 
             // we need to modify our holdings in lght of the split factor
-            var quantity = security.Holdings.Quantity/split.SplitFactor;
-            var avgPrice = security.Holdings.AveragePrice*split.SplitFactor;
+            var quantity = security.Holdings.Quantity / split.SplitFactor;
+            var avgPrice = security.Holdings.AveragePrice * split.SplitFactor;
 
             // we'll model this as a cash adjustment
-            var leftOver = quantity - (int) quantity;
-            var extraCash = leftOver*split.ReferencePrice;
+            var leftOver = quantity - (int)quantity;
+            var extraCash = leftOver * split.ReferencePrice;
             _baseCurrencyCash.AddAmount(extraCash);
 
-            security.Holdings.SetHoldings(avgPrice, (int) quantity);
+            security.Holdings.SetHoldings(avgPrice, (int)quantity);
 
             // build a 'next' value to update the market prices in light of the split factor
             var next = security.GetLastData();
@@ -650,7 +607,7 @@ namespace QuantConnect.Securities
                 tradeBar.High *= split.SplitFactor;
                 tradeBar.Low *= split.SplitFactor;
             }
-            
+
             // make sure to modify bid/ask as well for tradebar data types
             var tick = next as Tick;
             if (tick != null)
@@ -689,10 +646,12 @@ namespace QuantConnect.Securities
         Security ISecurityProvider.GetSecurity(Symbol symbol)
         {
             Security security;
+
             if (Securities.TryGetValue(symbol, out security))
             {
                 return security;
             }
+
             return null;
         }
 

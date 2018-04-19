@@ -1,11 +1,11 @@
 /*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,7 +17,7 @@ using System;
 using QuantConnect.Data.Market;
 
 namespace QuantConnect.Data.Consolidators
-{    
+{
     /// <summary>
     /// A data consolidator that can make bigger bars from ticks over a given
     /// time span or a count of pieces of data.
@@ -53,6 +53,16 @@ namespace QuantConnect.Data.Consolidators
         }
 
         /// <summary>
+        /// Determines whether or not the specified data should be processd
+        /// </summary>
+        /// <param name="data">The data to check</param>
+        /// <returns>True if the consolidator should process this data, false otherwise</returns>
+        protected override bool ShouldProcess(Tick data)
+        {
+            return data.TickType == TickType.Trade;
+        }
+
+        /// <summary>
         /// Aggregates the new 'data' into the 'workingBar'. The 'workingBar' will be
         /// null following the event firing
         /// </summary>
@@ -74,6 +84,8 @@ namespace QuantConnect.Data.Consolidators
                     Value = data.Value,
                     Volume = data.Quantity
                 };
+
+                if (Period.HasValue) workingBar.Period = Period.Value;
             }
             else
             {

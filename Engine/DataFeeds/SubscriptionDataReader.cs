@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -27,6 +27,7 @@ using QuantConnect.Interfaces;
 using QuantConnect.Lean.Engine.Results;
 using QuantConnect.Logging;
 using QuantConnect.Util;
+using QuantConnect.Securities.Option;
 
 namespace QuantConnect.Lean.Engine.DataFeeds
 {
@@ -72,7 +73,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         // and on the next trading day we use this data to produce the split instance
         private decimal? _splitFactor;
 
-        // we'll use these flags to denote we've already fired off the DelistedType.Warning
+        // we'll use these flags to denote we've already fired off the DelistingType.Warning
         // and a DelistedType.Delisted Delisting object, the _delistingType object is save here
         // since we need to wait for the next trading day before emitting
         private bool _delisted;
@@ -90,6 +91,8 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         // used when emitting aux data from within while loop
         private bool _emittedAuxilliaryData;
         private BaseData _lastInstanceBeforeAuxilliaryData;
+        private readonly IDataProvider _dataProvider;
+        private readonly IDataCacheProvider _dataCacheProvider;
 
         /// <summary>
         /// Last read BaseData object from this type and source
@@ -117,6 +120,8 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// <param name="resultHandler">Result handler used to push error messages and perform sampling on skipped days</param>
         /// <param name="mapFileResolver">Used for resolving the correct map files</param>
         /// <param name="factorFileProvider">Used for getting factor files</param>
+        /// <param name="dataProvider">Used for getting files not present on disk</param>
+        /// <param name="dataCacheProvider">Used for caching files</param>
         /// <param name="tradeableDates">Defines the dates for which we'll request data, in order, in the security's exchange time zone</param>
         /// <param name="isLiveMode">True if we're in live mode, false otherwise</param>
         /// <param name="includeAuxilliaryData">True if we want to emit aux data, false to only emit price data</param>
@@ -126,8 +131,10 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             IResultHandler resultHandler,
             MapFileResolver mapFileResolver,
             IFactorFileProvider factorFileProvider,
+            IDataProvider dataProvider,
             IEnumerable<DateTime> tradeableDates,
             bool isLiveMode,
+            IDataCacheProvider dataCacheProvider,
             bool includeAuxilliaryData = true)
         {
             //Save configuration of data-subscription:
@@ -138,6 +145,8 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             //Save Start and End Dates:
             _periodStart = periodStart;
             _periodFinish = periodFinish;
+            _dataProvider = dataProvider;
+            _dataCacheProvider = dataCacheProvider;
 
             //Save access to securities
             _isLiveMode = isLiveMode;
@@ -158,7 +167,8 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             }
 
             //Create an instance of the "Type":
-            var userObj = objectActivator.Invoke(new object[] {});
+            var userObj = objectActivator.Invoke(new object[] { config.Type });
+
             _dataFactory = userObj as BaseData;
 
             //If its quandl set the access token in data factory:
@@ -179,7 +189,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             {
                 try
                 {
-                    var mapFile = mapFileResolver.ResolveMapFile(config.Symbol.Value, DateTime.Today);
+                    var mapFile = mapFileResolver.ResolveMapFile(config.Symbol.ID.Symbol, config.Symbol.ID.Date);
 
                     // only take the resolved map file if it has data, otherwise we'll use the empty one we defined above
                     if (mapFile.Any()) _mapFile = mapFile;
@@ -189,11 +199,41 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                     if (_hasScaleFactors)
                     {
                         _factorFile = factorFile;
+
+                        // if factor file has minimum date, update start period if before minimum date
+                        if (!_isLiveMode && _factorFile != null && _factorFile.FactorFileMinimumDate.HasValue)
+                        {
+                            if (_periodStart < _factorFile.FactorFileMinimumDate.Value)
+                            {
+                                _periodStart = _factorFile.FactorFileMinimumDate.Value;
+
+                                _resultHandler.DebugMessage(
+                                    string.Format("Data for symbol {0} has been limited due to numerical precision issues in the factor file. The starting date has been set to {1}.",
+                                    config.Symbol.Value,
+                                    _factorFile.FactorFileMinimumDate.Value.ToShortDateString()));
+                            }
+                        }
                     }
                 }
                 catch (Exception err)
                 {
                     Log.Error(err, "Fetching Price/Map Factors: " + config.Symbol.ID + ": ");
+                }
+            }
+
+            // load up the map and factor files for underlying of equity option
+            if (!config.IsCustomData && config.SecurityType == SecurityType.Option)
+            {
+                try
+                {
+                    var mapFile = mapFileResolver.ResolveMapFile(config.Symbol.Underlying.ID.Symbol, config.Symbol.Underlying.ID.Date);
+
+                    // only take the resolved map file if it has data, otherwise we'll use the empty one we defined above
+                    if (mapFile.Any()) _mapFile = mapFile;
+                }
+                catch (Exception err)
+                {
+                    Log.Error(err, "Map Factors: " + config.Symbol.ID + ": ");
                 }
             }
 
@@ -297,6 +337,8 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                     // as updating factors and symbol mapping as well as detecting aux data
                     if (instance.EndTime.Date > _tradeableDates.Current)
                     {
+                        var currentPriceScaleFactor = _config.PriceScaleFactor;
+
                         // this is fairly hacky and could be solved by removing the aux data from this class
                         // the case is with coarse data files which have many daily sized data points for the
                         // same date,
@@ -314,6 +356,24 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                             // since we're emitting this here we need to save off the instance for next time
                             Current = _auxiliaryData.Dequeue();
                             _emittedAuxilliaryData = true;
+
+                            // with hourly resolution the first bar for the new date is received
+                            // before the price scale factor is updated by ResolveDataEnumerator,
+                            // so we have to 'rescale' prices before emitting the bar
+                            if (_config.Resolution == Resolution.Hour &&
+                               (_config.SecurityType == SecurityType.Equity || _config.SecurityType == SecurityType.Option))
+                            {
+                                var tradeBar = instance as TradeBar;
+                                if (tradeBar != null)
+                                {
+                                    var bar = tradeBar;
+                                    bar.Open = _config.GetNormalizedPrice(GetRawValue(bar.Open, _config.SumOfDividends, currentPriceScaleFactor));
+                                    bar.High = _config.GetNormalizedPrice(GetRawValue(bar.High, _config.SumOfDividends, currentPriceScaleFactor));
+                                    bar.Low = _config.GetNormalizedPrice(GetRawValue(bar.Low, _config.SumOfDividends, currentPriceScaleFactor));
+                                    bar.Close = _config.GetNormalizedPrice(GetRawValue(bar.Close, _config.SumOfDividends, currentPriceScaleFactor));
+                                }
+                            }
+
                             _lastInstanceBeforeAuxilliaryData = instance;
                             return true;
                         }
@@ -322,6 +382,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                     // we've made it past all of our filters, we're withing the requested start/end of the subscription,
                     // we've satisfied user and market hour filters, so this data is good to go as current
                     Current = instance;
+
                     return true;
                 }
 
@@ -400,7 +461,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
 
         private ISubscriptionDataSourceReader CreateSubscriptionFactory(SubscriptionDataSource source)
         {
-            var factory = SubscriptionDataSourceReader.ForSource(source, _config, _tradeableDates.Current, _isLiveMode);
+            var factory = SubscriptionDataSourceReader.ForSource(source, _dataCacheProvider, _config, _tradeableDates.Current, _isLiveMode);
             AttachEventHandlers(factory, source);
             return factory;
         }
@@ -414,13 +475,11 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 {
                     case SubscriptionTransportMedium.LocalFile:
                         // the local uri doesn't exist, write an error and return null so we we don't try to get data for today
-                        Log.Trace(string.Format("SubscriptionDataReader.GetReader(): Could not find QC Data, skipped: {0}", source));
-                        _resultHandler.SamplePerformance(_tradeableDates.Current, 0);
+                        // Log.Trace(string.Format("SubscriptionDataReader.GetReader(): Could not find QC Data, skipped: {0}", source));
                         break;
 
                     case SubscriptionTransportMedium.RemoteFile:
                         _resultHandler.ErrorMessage(string.Format("Error downloading custom data source file, skipped: {0} Error: {1}", source, args.Exception.Message), args.Exception.StackTrace);
-                        _resultHandler.SamplePerformance(_tradeableDates.Current.Date, 0);
                         break;
 
                     case SubscriptionTransportMedium.Rest:
@@ -437,7 +496,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 var textSubscriptionFactory = (TextSubscriptionDataSourceReader)dataSourceReader;
                 textSubscriptionFactory.CreateStreamReaderError += (sender, args) =>
                 {
-                    Log.Error(string.Format("Failed to get StreamReader for data source({0}), symbol({1}). Skipping date({2}). Reader is null.", args.Source.Source, _mappedSymbol, args.Date.ToShortDateString()));
+                    //Log.Error(string.Format("Failed to get StreamReader for data source({0}), symbol({1}). Skipping date({2}). Reader is null.", args.Source.Source, _mappedSymbol, args.Date.ToShortDateString()));
                     if (_config.IsCustomData)
                     {
                         _resultHandler.ErrorMessage(string.Format("We could not fetch the requested data. This may not be valid data, or a failed download of custom data. Skipping source ({0}).", args.Source.Source));
@@ -471,6 +530,10 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 date = _tradeableDates.Current;
 
                 CheckForDelisting(date);
+                if (_delisted)
+                {
+                    return true;
+                }
 
                 if (!_mapFile.HasData(date))
                 {
@@ -490,17 +553,20 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 // if we have factor files check to see if we need to update the scale factors
                 if (_hasScaleFactors)
                 {
-                    // check to see if the symbol was remapped
-                    var newSymbol = _mapFile.GetMappedSymbol(date);
-                    if (_mappedSymbol != "" && newSymbol != _mappedSymbol)
+                    // update our price scaling factors in light of the normalization mode
+                    UpdateScaleFactors(date);
+                }
+
+                // check to see if the symbol was remapped
+                var newSymbol = _mapFile.GetMappedSymbol(date);
+                if (newSymbol != _mappedSymbol)
+                {
+                    if (_mappedSymbol != "")
                     {
                         var changed = new SymbolChangedEvent(_config.Symbol, date, _mappedSymbol, newSymbol);
                         _auxiliaryData.Enqueue(changed);
                     }
                     _config.MappedSymbol = _mappedSymbol = newSymbol;
-
-                    // update our price scaling factors in light of the normalization mode
-                    UpdateScaleFactors(date);
                 }
 
                 // we've passed initial checks,now go get data for this date!
@@ -513,7 +579,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         }
 
         /// <summary>
-        /// For backwards adjusted data the price is adjusted by a scale factor which is a combination of splits and dividends. 
+        /// For backwards adjusted data the price is adjusted by a scale factor which is a combination of splits and dividends.
         /// This backwards adjusted price is used by default and fed as the current price.
         /// </summary>
         /// <param name="date">Current date of the backtest.</param>
@@ -552,10 +618,11 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// </summary>
         private void CheckForSplit(DateTime date)
         {
-            if (_splitFactor != null)
+            var factor = _splitFactor;
+            if (factor != null)
             {
                 var close = GetRawClose();
-                var split = new Split(_config.Symbol, date, close, _splitFactor.Value);
+                var split = new Split(_config.Symbol, date, close, factor.Value, SplitType.SplitOccurred);
                 _auxiliaryData.Enqueue(split);
                 _splitFactor = null;
             }
@@ -564,6 +631,8 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             if (_factorFile.HasSplitEventOnNextTradingDay(date, out splitFactor))
             {
                 _splitFactor = splitFactor;
+                var split = new Split(_config.Symbol, date, GetRawClose(), splitFactor, SplitType.Warning);
+                _auxiliaryData.Enqueue(split);
             }
         }
 
@@ -595,19 +664,33 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// </summary>
         private void CheckForDelisting(DateTime date)
         {
-            // these ifs set flags to tell us to produce a delisting instance
-            if (!_delistedWarning && date >= _mapFile.DelistingDate)
+            DateTime delistingDate;
+
+            switch (_config.Symbol.ID.SecurityType)
+            {
+                case SecurityType.Future:
+                    delistingDate = _config.Symbol.ID.Date;
+                    break;
+                case SecurityType.Option:
+                    delistingDate = OptionSymbol.GetLastDayOfTrading(_config.Symbol);
+                    break;
+                default:
+                    delistingDate = _mapFile.DelistingDate;
+                    break;
+            }
+
+            if (!_delistedWarning && date >= delistingDate)
             {
                 _delistedWarning = true;
                 var price = _previous != null ? _previous.Price : 0;
                 _auxiliaryData.Enqueue(new Delisting(_config.Symbol, date, price, DelistingType.Warning));
             }
-            else if (!_delisted && date > _mapFile.DelistingDate)
+            else if (!_delisted && date > delistingDate)
             {
                 _delisted = true;
                 var price = _previous != null ? _previous.Price : 0;
                 // delisted at EOD
-                _auxiliaryData.Enqueue(new Delisting(_config.Symbol, _mapFile.DelistingDate.AddDays(1), price, DelistingType.Delisted));
+                _auxiliaryData.Enqueue(new Delisting(_config.Symbol, delistingDate.AddDays(1), price, DelistingType.Delisted));
             }
         }
 
@@ -616,10 +699,14 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// </summary>
         private decimal GetRawClose()
         {
-            if (_previous == null) return 0m;
+            return _previous == null ? 0m : GetRawValue(_previous.Value, _config.SumOfDividends, _config.PriceScaleFactor);
+        }
 
-            var close = _previous.Value;
-
+        /// <summary>
+        /// Un-normalizes a price
+        /// </summary>
+        private decimal GetRawValue(decimal price, decimal sumOfDividends, decimal priceScaleFactor)
+        {
             switch (_config.DataNormalizationMode)
             {
                 case DataNormalizationMode.Raw:
@@ -628,18 +715,18 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 case DataNormalizationMode.SplitAdjusted:
                 case DataNormalizationMode.Adjusted:
                     // we need to 'unscale' the price
-                    close = close / _config.PriceScaleFactor;
+                    price = price / priceScaleFactor;
                     break;
 
                 case DataNormalizationMode.TotalReturn:
                     // we need to remove the dividends since we've been accumulating them in the price
-                    close = (close - _config.SumOfDividends) / _config.PriceScaleFactor;
+                    price = (price - sumOfDividends) / priceScaleFactor;
                     break;
 
                 default:
                     throw new ArgumentOutOfRangeException();
             }
-            return close;
+            return price;
         }
 
         /// <summary>

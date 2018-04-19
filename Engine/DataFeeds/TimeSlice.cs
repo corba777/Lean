@@ -1,11 +1,11 @@
 /*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,15 +16,12 @@
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
-using Microsoft.Scripting.Utils;
 using NodaTime;
 using QuantConnect.Data;
 using QuantConnect.Data.Market;
 using QuantConnect.Data.UniverseSelection;
 using QuantConnect.Securities;
 using QuantConnect.Securities.Option;
-using QuantConnect.Util;
 
 namespace QuantConnect.Lean.Engine.DataFeeds
 {
@@ -54,11 +51,6 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         public Slice Slice { get; private set; }
 
         /// <summary>
-        /// Gets the data used to update the cash book
-        /// </summary>
-        public List<UpdateData<Cash>> CashBookUpdateData { get; private set; }
-
-        /// <summary>
         /// Gets the data used to update securities
         /// </summary>
         public List<UpdateData<Security>> SecuritiesUpdateData { get; private set; }
@@ -85,7 +77,6 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             int dataPointCount,
             Slice slice,
             List<DataFeedPacket> data,
-            List<UpdateData<Cash>> cashBookUpdateData,
             List<UpdateData<Security>> securitiesUpdateData,
             List<UpdateData<SubscriptionDataConfig>> consolidatorUpdateData,
             List<UpdateData<Security>> customData,
@@ -96,7 +87,6 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             Slice = slice;
             CustomData = customData;
             DataPointCount = dataPointCount;
-            CashBookUpdateData = cashBookUpdateData;
             SecuritiesUpdateData = securitiesUpdateData;
             ConsolidatorUpdateData = consolidatorUpdateData;
             SecurityChanges = securityChanges;
@@ -118,13 +108,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             var custom = new List<UpdateData<Security>>();
             var consolidator = new List<UpdateData<SubscriptionDataConfig>>();
             var allDataForAlgorithm = new List<BaseData>(data.Count);
-            var cash = new List<UpdateData<Cash>>(cashBook.Count);
-
-            var cashSecurities = new HashSet<Symbol>();
-            foreach (var cashItem in cashBook.Values)
-            {
-                cashSecurities.Add(cashItem.SecuritySymbol);
-            }
+            var optionUnderlyingUpdates = new Dictionary<Symbol, BaseData>();
 
             Split split;
             Dividend dividend;
@@ -145,15 +129,17 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             var dividends = new Dividends(algorithmTime);
             var delistings = new Delistings(algorithmTime);
             var optionChains = new OptionChains(algorithmTime);
+            var futuresChains = new FuturesChains(algorithmTime);
             var symbolChanges = new SymbolChangedEvents(algorithmTime);
 
+            // ensure we read equity data before option data, so we can set the current underlying price
             foreach (var packet in data)
             {
                 var list = packet.Data;
                 var symbol = packet.Security.Symbol;
 
                 if (list.Count == 0) continue;
-                
+
                 // keep count of all data points
                 if (list.Count == 1 && list[0] is BaseDataCollection)
                 {
@@ -169,6 +155,12 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                     count += list.Count;
                 }
 
+                if (!packet.Configuration.IsInternalFeed && packet.Configuration.IsCustomData)
+                {
+                    // This is all the custom data
+                    custom.Add(new UpdateData<Security>(packet.Security, packet.Configuration.Type, list));
+                }
+
                 var securityUpdate = new List<BaseData>(list.Count);
                 var consolidatorUpdate = new List<BaseData>(list.Count);
                 for (int i = 0; i < list.Count; i++)
@@ -178,23 +170,13 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                     {
                         // this is all the data that goes into the algorithm
                         allDataForAlgorithm.Add(baseData);
-                        if (packet.Configuration.IsCustomData)
-                        {
-                            // This is all the custom data
-                            // Add the list to the custom data when its unique.
-                            var exists = custom.Any(x => x.DataType == packet.Configuration.Type);
-                            if (!exists)
-                            {
-                                custom.Add(new UpdateData<Security>(packet.Security, packet.Configuration.Type, list));
-                            }
-                        }
                     }
                     // don't add internal feed data to ticks/bars objects
                     if (baseData.DataType != MarketDataType.Auxiliary)
                     {
                         if (!packet.Configuration.IsInternalFeed)
                         {
-                            PopulateDataDictionaries(baseData, ticks, tradeBars, quoteBars, optionChains);
+                            PopulateDataDictionaries(baseData, ticks, tradeBars, quoteBars, optionChains, futuresChains);
 
                             // special handling of options data to build the option chain
                             if (packet.Security.Type == SecurityType.Option)
@@ -203,7 +185,20 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                                 {
                                     optionChains[baseData.Symbol] = (OptionChain) baseData;
                                 }
-                                else if (!HandleOptionData(algorithmTime, baseData, optionChains, packet.Security, sliceFuture))
+                                else if (!HandleOptionData(algorithmTime, baseData, optionChains, packet.Security, sliceFuture, optionUnderlyingUpdates))
+                                {
+                                    continue;
+                                }
+                            }
+
+                            // special handling of futures data to build the futures chain
+                            if (packet.Security.Type == SecurityType.Future)
+                            {
+                                if (baseData.DataType == MarketDataType.FuturesChain)
+                                {
+                                    futuresChains[baseData.Symbol] = (FuturesChain)baseData;
+                                }
+                                else if (!HandleFuturesData(algorithmTime, baseData, futuresChains, packet.Security))
                                 {
                                     continue;
                                 }
@@ -214,7 +209,17 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                         }
 
                         // this is the data used set market prices
+                        // do not add it if it is a Suspicious tick
+                        var tick = baseData as Tick;
+                        if (tick != null && tick.Suspicious) continue;
+
                         securityUpdate.Add(baseData);
+
+                        // option underlying security update
+                        if (packet.Security.Symbol.SecurityType == SecurityType.Equity)
+                        {
+                            optionUnderlyingUpdates[packet.Security.Symbol] = baseData;
+                        }
                     }
                     // include checks for various aux types so we don't have to construct the dictionaries in Slice
                     else if ((delisting = baseData as Delisting) != null)
@@ -238,22 +243,6 @@ namespace QuantConnect.Lean.Engine.DataFeeds
 
                 if (securityUpdate.Count > 0)
                 {
-                    // check for 'cash securities' if we found valid update data for this symbol
-                    // and we need this data to update cash conversion rates, long term we should
-                    // have Cash hold onto it's security, then he can update himself, or rather, just
-                    // patch through calls to conversion rate to compue it on the fly using Security.Price
-                    if (cashSecurities.Contains(packet.Security.Symbol))
-                    {
-                        foreach (var cashKvp in cashBook)
-                        {
-                            if (cashKvp.Value.SecuritySymbol == packet.Security.Symbol)
-                            {
-                                var cashUpdates = new List<BaseData> {securityUpdate[securityUpdate.Count - 1]};
-                                cash.Add(new UpdateData<Cash>(cashKvp.Value, packet.Configuration.Type, cashUpdates));
-                            }
-                        }
-                    }
-
                     security.Add(new UpdateData<Security>(packet.Security, packet.Configuration.Type, securityUpdate));
                 }
                 if (consolidatorUpdate.Count > 0)
@@ -262,15 +251,15 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 }
             }
 
-            slice = new Slice(algorithmTime, allDataForAlgorithm, tradeBars, quoteBars, ticks, optionChains, splits, dividends, delistings, symbolChanges, allDataForAlgorithm.Count > 0);
+            slice = new Slice(algorithmTime, allDataForAlgorithm, tradeBars, quoteBars, ticks, optionChains, futuresChains, splits, dividends, delistings, symbolChanges, allDataForAlgorithm.Count > 0);
 
-            return new TimeSlice(utcDateTime, count, slice, data, cash, security, consolidator, custom, changes);
+            return new TimeSlice(utcDateTime, count, slice, data, security, consolidator, custom, changes);
         }
 
         /// <summary>
         /// Adds the specified <see cref="BaseData"/> instance to the appropriate <see cref="DataDictionary{T}"/>
         /// </summary>
-        private static void PopulateDataDictionaries(BaseData baseData, Ticks ticks, TradeBars tradeBars, QuoteBars quoteBars, OptionChains optionChains)
+        private static void PopulateDataDictionaries(BaseData baseData, Ticks ticks, TradeBars tradeBars, QuoteBars quoteBars, OptionChains optionChains, FuturesChains futuresChains)
         {
             var symbol = baseData.Symbol;
 
@@ -292,19 +281,38 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 case MarketDataType.OptionChain:
                     optionChains[symbol] = (OptionChain) baseData;
                     break;
+
+                case MarketDataType.FuturesChain:
+                    futuresChains[symbol] = (FuturesChain)baseData;
+                    break;
             }
         }
 
-        private static bool HandleOptionData(DateTime algorithmTime, BaseData baseData, OptionChains optionChains, Security security, Lazy<Slice> sliceFuture)
+        private static bool HandleOptionData(DateTime algorithmTime, BaseData baseData, OptionChains optionChains, Security security, Lazy<Slice> sliceFuture, IReadOnlyDictionary<Symbol, BaseData> optionUnderlyingUpdates)
         {
             var symbol = baseData.Symbol;
-            
+
             OptionChain chain;
-            var canonical = Symbol.Create(symbol.ID.Symbol, SecurityType.Option, symbol.ID.Market);
+            var canonical = Symbol.CreateOption(symbol.Underlying, symbol.ID.Market, default(OptionStyle), default(OptionRight), 0, SecurityIdentifier.DefaultDate);
             if (!optionChains.TryGetValue(canonical, out chain))
             {
                 chain = new OptionChain(canonical, algorithmTime);
                 optionChains[canonical] = chain;
+            }
+
+            // set the underlying current data point in the option chain
+            var option = security as Option;
+            if (option != null)
+            {
+                var underlyingData = option.Underlying.GetLastData();
+
+                BaseData underlyingUpdate;
+                if (optionUnderlyingUpdates.TryGetValue(option.Underlying.Symbol, out underlyingUpdate))
+                {
+                    underlyingData = underlyingUpdate;
+                }
+
+                chain.Underlying = underlyingData;
             }
 
             var universeData = baseData as OptionChainUniverseDataCollection;
@@ -312,7 +320,10 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             {
                 if (universeData.Underlying != null)
                 {
-                    chain.Underlying = universeData.Underlying;
+                    foreach(var addedContract in chain.Contracts)
+                    {
+                        addedContract.Value.UnderlyingLastPrice = chain.Underlying.Price;
+                    }
                 }
                 foreach (var contractSymbol in universeData.FilteredContracts)
                 {
@@ -324,19 +335,22 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             OptionContract contract;
             if (!chain.Contracts.TryGetValue(baseData.Symbol, out contract))
             {
-                var underlyingSymbol = Symbol.Create(baseData.Symbol.ID.Symbol, SecurityType.Equity, baseData.Symbol.ID.Market);
+                var underlyingSymbol = baseData.Symbol.Underlying;
                 contract = new OptionContract(baseData.Symbol, underlyingSymbol)
                 {
                     Time = baseData.EndTime,
                     LastPrice = security.Close,
+                    Volume = (long)security.Volume,
                     BidPrice = security.BidPrice,
-                    BidSize = security.BidSize,
+                    BidSize = (long)security.BidSize,
                     AskPrice = security.AskPrice,
-                    AskSize = security.AskSize,
-                    UnderlyingLastPrice = chain.Underlying != null ? chain.Underlying.Price : 0m
+                    AskSize = (long)security.AskSize,
+                    OpenInterest = security.OpenInterest,
+                    UnderlyingLastPrice = chain.Underlying.Price
                 };
+
                 chain.Contracts[baseData.Symbol] = contract;
-                var option = security as Option;
+
                 if (option != null)
                 {
                     contract.SetOptionPriceModel(() => option.PriceModel.Evaluate(option, sliceFuture.Value, contract));
@@ -355,7 +369,76 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 case MarketDataType.TradeBar:
                     var tradeBar = (TradeBar)baseData;
                     chain.TradeBars[symbol] = tradeBar;
-                    contract.LastPrice = tradeBar.Close;
+                    UpdateContract(contract, tradeBar);
+                    break;
+
+                case MarketDataType.QuoteBar:
+                    var quote = (QuoteBar)baseData;
+                    chain.QuoteBars[symbol] = quote;
+                    UpdateContract(contract, quote);
+                    break;
+
+                case MarketDataType.Base:
+                    chain.AddAuxData(baseData);
+                    break;
+            }
+            return true;
+        }
+
+
+        private static bool HandleFuturesData(DateTime algorithmTime, BaseData baseData, FuturesChains futuresChains, Security security)
+        {
+            var symbol = baseData.Symbol;
+
+            FuturesChain chain;
+            var canonical = Symbol.Create(symbol.ID.Symbol, SecurityType.Future, symbol.ID.Market);
+            if (!futuresChains.TryGetValue(canonical, out chain))
+            {
+                chain = new FuturesChain(canonical, algorithmTime);
+                futuresChains[canonical] = chain;
+            }
+
+            var universeData = baseData as FuturesChainUniverseDataCollection;
+            if (universeData != null)
+            {
+                foreach (var contractSymbol in universeData.FilteredContracts)
+                {
+                    chain.FilteredContracts.Add(contractSymbol);
+                }
+                return false;
+            }
+
+            FuturesContract contract;
+            if (!chain.Contracts.TryGetValue(baseData.Symbol, out contract))
+            {
+                var underlyingSymbol = baseData.Symbol.Underlying;
+                contract = new FuturesContract(baseData.Symbol, underlyingSymbol)
+                {
+                    Time = baseData.EndTime,
+                    LastPrice = security.Close,
+                    Volume = (long)security.Volume,
+                    BidPrice = security.BidPrice,
+                    BidSize = (long)security.BidSize,
+                    AskPrice = security.AskPrice,
+                    AskSize = (long)security.AskSize,
+                    OpenInterest = security.OpenInterest
+                };
+                chain.Contracts[baseData.Symbol] = contract;
+            }
+
+            // populate ticks and tradebars dictionaries with no aux data
+            switch (baseData.DataType)
+            {
+                case MarketDataType.Tick:
+                    var tick = (Tick)baseData;
+                    chain.Ticks.Add(tick.Symbol, tick);
+                    UpdateContract(contract, tick);
+                    break;
+
+                case MarketDataType.TradeBar:
+                    var tradeBar = (TradeBar)baseData;
+                    chain.TradeBars[symbol] = tradeBar;
+                    UpdateContract(contract, tradeBar);
                     break;
 
                 case MarketDataType.QuoteBar:
@@ -376,12 +459,12 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             if (quote.Ask != null && quote.Ask.Close != 0m)
             {
                 contract.AskPrice = quote.Ask.Close;
-                contract.AskSize = quote.LastAskSize;
+                contract.AskSize = (long)quote.LastAskSize;
             }
             if (quote.Bid != null && quote.Bid.Close != 0m)
             {
                 contract.BidPrice = quote.Bid.Close;
-                contract.BidSize = quote.LastBidSize;
+                contract.BidSize = (long)quote.LastBidSize;
             }
         }
 
@@ -396,14 +479,77 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 if (tick.AskPrice != 0m)
                 {
                     contract.AskPrice = tick.AskPrice;
-                    contract.AskSize = tick.AskSize;
+                    contract.AskSize = (long)tick.AskSize;
                 }
                 if (tick.BidPrice != 0m)
                 {
                     contract.BidPrice = tick.BidPrice;
-                    contract.BidSize = tick.BidSize;
+                    contract.BidSize = (long)tick.BidSize;
                 }
             }
+            else if (tick.TickType == TickType.OpenInterest)
+            {
+                if (tick.Value != 0m)
+                {
+                    contract.OpenInterest = tick.Value;
+                }
+            }
+        }
+
+        private static void UpdateContract(OptionContract contract, TradeBar tradeBar)
+        {
+            if (tradeBar.Close == 0m) return;
+            contract.LastPrice = tradeBar.Close;
+            contract.Volume = (long)tradeBar.Volume;
+        }
+
+        private static void UpdateContract(FuturesContract contract, QuoteBar quote)
+        {
+            if (quote.Ask != null && quote.Ask.Close != 0m)
+            {
+                contract.AskPrice = quote.Ask.Close;
+                contract.AskSize = (long)quote.LastAskSize;
+            }
+            if (quote.Bid != null && quote.Bid.Close != 0m)
+            {
+                contract.BidPrice = quote.Bid.Close;
+                contract.BidSize = (long)quote.LastBidSize;
+            }
+        }
+
+        private static void UpdateContract(FuturesContract contract, Tick tick)
+        {
+            if (tick.TickType == TickType.Trade)
+            {
+                contract.LastPrice = tick.Price;
+            }
+            else if (tick.TickType == TickType.Quote)
+            {
+                if (tick.AskPrice != 0m)
+                {
+                    contract.AskPrice = tick.AskPrice;
+                    contract.AskSize = (long)tick.AskSize;
+                }
+                if (tick.BidPrice != 0m)
+                {
+                    contract.BidPrice = tick.BidPrice;
+                    contract.BidSize = (long)tick.BidSize;
+                }
+            }
+            else if (tick.TickType == TickType.OpenInterest)
+            {
+                if (tick.Value != 0m)
+                {
+                    contract.OpenInterest = tick.Value;
+                }
+            }
+        }
+
+        private static void UpdateContract(FuturesContract contract, TradeBar tradeBar)
+        {
+            if (tradeBar.Close == 0m) return;
+            contract.LastPrice = tradeBar.Close;
+            contract.Volume = (long)tradeBar.Volume;
         }
     }
 }

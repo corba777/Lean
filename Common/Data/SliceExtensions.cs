@@ -1,11 +1,11 @@
 /*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,8 +14,10 @@
 */
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using QuantConnect.Data.Consolidators;
 using QuantConnect.Data.Market;
 using QuantConnect.Util;
 
@@ -67,7 +69,7 @@ namespace QuantConnect.Data
         /// <param name="symbol">The symbol to retrieve</param>
         /// <returns>An enumerable of T for the matching symbol, if no T is found for symbol, empty enumerable is returned</returns>
         public static IEnumerable<T> Get<T>(this IEnumerable<DataDictionary<T>> dataDictionaries, Symbol symbol)
-            where T : BaseData
+            where T : IBaseData
         {
             return dataDictionaries.Where(x => x.ContainsKey(symbol)).Select(x => x[symbol]);
         }
@@ -120,7 +122,7 @@ namespace QuantConnect.Data
         /// <param name="slices">The enumerable of slice</param>
         /// <returns>An enumerable of data dictionary of the requested type</returns>
         public static IEnumerable<DataDictionary<T>> Get<T>(this IEnumerable<Slice> slices)
-            where T : BaseData
+            where T : IBaseData
         {
             return slices.Select(x => x.Get<T>()).Where(x => x.Count > 0);
         }
@@ -133,7 +135,7 @@ namespace QuantConnect.Data
         /// <param name="symbol">The symbol to retrieve</param>
         /// <returns>An enumerable of T by accessing each slice for the requested symbol</returns>
         public static IEnumerable<T> Get<T>(this IEnumerable<Slice> slices, Symbol symbol)
-            where T : BaseData
+            where T : IBaseData
         {
             return slices.Select(x => x.Get<T>()).Where(x => x.ContainsKey(symbol)).Select(x => x[symbol]);
         }
@@ -167,6 +169,59 @@ namespace QuantConnect.Data
         public static double[] ToDoubleArray(this IEnumerable<decimal> decimals)
         {
             return decimals.Select(x => (double) x).ToArray();
+        }
+
+        /// <summary>
+        /// Loops through the specified slices and pushes the data into the consolidators. This can be used to
+        /// easily warm up indicators from a history call that returns slice objects.
+        /// </summary>
+        /// <param name="slices">The data to send into the consolidators, likely result of a history request</param>
+        /// <param name="consolidatorsBySymbol">Dictionary of consolidators keyed by symbol</param>
+        public static void PushThroughConsolidators(this IEnumerable<Slice> slices, Dictionary<Symbol, IDataConsolidator> consolidatorsBySymbol)
+        {
+            PushThroughConsolidators(slices, symbol =>
+            {
+                IDataConsolidator consolidator;
+                consolidatorsBySymbol.TryGetValue(symbol, out consolidator);
+                return consolidator;
+            });
+        }
+
+        /// <summary>
+        /// Loops through the specified slices and pushes the data into the consolidators. This can be used to
+        /// easily warm up indicators from a history call that returns slice objects.
+        /// </summary>
+        /// <param name="slices">The data to send into the consolidators, likely result of a history request</param>
+        /// <param name="consolidatorsProvider">Delegate that fetches the consolidators by a symbol</param>
+        public static void PushThroughConsolidators(this IEnumerable<Slice> slices, Func<Symbol, IDataConsolidator> consolidatorsProvider)
+        {
+            slices.PushThrough(data => consolidatorsProvider(data?.Symbol)?.Update(data));
+        }
+
+        /// <summary>
+        /// Loops through the specified slices and pushes the data into the consolidators. This can be used to
+        /// easily warm up indicators from a history call that returns slice objects.
+        /// </summary>
+        /// <param name="slices">The data to send into the consolidators, likely result of a history request</param>
+        /// <param name="handler">Delegate handles each data piece from the slice</param>
+        public static void PushThrough(this IEnumerable<Slice> slices, Action<BaseData> handler)
+        {
+            foreach (var slice in slices)
+            {
+                foreach (var symbol in slice.Keys)
+                {
+                    dynamic value;
+                    if (!slice.TryGetValue(symbol, out value))
+                    {
+                        continue;
+                    }
+
+                    var list = value as IList;
+                    var data = (BaseData)(list != null ? list[list.Count - 1] : value);
+
+                    handler(data);
+                }
+            }
         }
     }
 }

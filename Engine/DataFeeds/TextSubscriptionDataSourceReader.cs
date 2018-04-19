@@ -1,11 +1,11 @@
 /*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,15 +16,15 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
-using System.IO;
 using QuantConnect.Data;
+using QuantConnect.Interfaces;
 using QuantConnect.Lean.Engine.DataFeeds.Transport;
 using QuantConnect.Util;
 
 namespace QuantConnect.Lean.Engine.DataFeeds
 {
     /// <summary>
-    /// Provides an implementations of <see cref="ISubscriptionDataSourceReader"/> that uses the 
+    /// Provides an implementations of <see cref="ISubscriptionDataSourceReader"/> that uses the
     /// <see cref="BaseData.Reader(QuantConnect.Data.SubscriptionDataConfig,string,System.DateTime,bool)"/>
     /// method to read lines of text from a <see cref="SubscriptionDataSource"/>
     /// </summary>
@@ -34,6 +34,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         private readonly BaseData _factory;
         private readonly DateTime _date;
         private readonly SubscriptionDataConfig _config;
+        private readonly IDataCacheProvider _dataCacheProvider;
 
         /// <summary>
         /// Event fired when the specified source is considered invalid, this may
@@ -42,7 +43,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         public event EventHandler<InvalidSourceEventArgs> InvalidSource;
 
         /// <summary>
-        /// Event fired when an exception is thrown during a call to 
+        /// Event fired when an exception is thrown during a call to
         /// <see cref="BaseData.Reader(QuantConnect.Data.SubscriptionDataConfig,string,System.DateTime,bool)"/>
         /// </summary>
         public event EventHandler<ReaderErrorEventArgs> ReaderError;
@@ -53,18 +54,21 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// </summary>
         public event EventHandler<CreateStreamReaderErrorEventArgs> CreateStreamReaderError;
 
+
         /// <summary>
         /// Initializes a new instance of the <see cref="TextSubscriptionDataSourceReader"/> class
         /// </summary>
+        /// <param name="dataCacheProvider">This provider caches files if needed</param>
         /// <param name="config">The subscription's configuration</param>
         /// <param name="date">The date this factory was produced to read data for</param>
         /// <param name="isLiveMode">True if we're in live mode, false for backtesting</param>
-        public TextSubscriptionDataSourceReader(SubscriptionDataConfig config, DateTime date, bool isLiveMode)
+        public TextSubscriptionDataSourceReader(IDataCacheProvider dataCacheProvider, SubscriptionDataConfig config, DateTime date, bool isLiveMode)
         {
+            _dataCacheProvider = dataCacheProvider;
             _date = date;
             _config = config;
             _isLiveMode = isLiveMode;
-            _factory = (BaseData) ObjectActivator.GetActivator(config.Type).Invoke(new object[0]);
+            _factory = (BaseData) ObjectActivator.GetActivator(config.Type).Invoke(new object[] { config.Type });
         }
 
         /// <summary>
@@ -91,14 +95,14 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                     BaseData instance = null;
                     try
                     {
-                        instance  = _factory.Reader(_config, line, _date, _isLiveMode);
+                        instance = _factory.Reader(_config, line, _date, _isLiveMode);
                     }
                     catch (Exception err)
                     {
                         OnReaderError(line, err);
                     }
 
-                    if (instance != null)
+                    if (instance != null && instance.EndTime != default(DateTime))
                     {
                         yield return instance;
                     }
@@ -125,7 +129,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                     break;
 
                 case SubscriptionTransportMedium.Rest:
-                    reader = new RestSubscriptionStreamReader(subscriptionDataSource.Source);
+                    reader = new RestSubscriptionStreamReader(subscriptionDataSource.Source, subscriptionDataSource.Headers, _isLiveMode);
                     break;
 
                 default:
@@ -172,23 +176,8 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// </summary>
         private IStreamReader HandleLocalFileSource(SubscriptionDataSource source)
         {
-            string entryName = null; // default to all entries
-            var file = source.Source;
-            var hashIndex = source.Source.LastIndexOf("#", StringComparison.Ordinal);
-            if (hashIndex != -1)
-            {
-                entryName = source.Source.Substring(hashIndex + 1);
-                file = source.Source.Substring(0, hashIndex);
-            }
-
-            if (!File.Exists(file))
-            {
-                OnInvalidSource(source, new FileNotFoundException("The specified file was not found", file));
-                return null;
-            }
-
             // handles zip or text files
-            return new LocalFileSubscriptionStreamReader(file, entryName);
+            return new LocalFileSubscriptionStreamReader(_dataCacheProvider, source.Source);
         }
 
         /// <summary>
@@ -196,17 +185,12 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// </summary>
         private IStreamReader HandleRemoteSourceFile(SubscriptionDataSource source)
         {
-            // clean old files out of the cache
-            if (!Directory.Exists(Globals.Cache)) Directory.CreateDirectory(Globals.Cache);
-            foreach (var file in Directory.EnumerateFiles(Globals.Cache))
-            {
-                if (File.GetCreationTime(file) < DateTime.Now.AddHours(-24)) File.Delete(file);
-            }
+            SubscriptionDataSourceReader.CheckRemoteFileCache();
 
             try
             {
                 // this will fire up a web client in order to download the 'source' file to the cache
-                return new RemoteFileSubscriptionStreamReader(source.Source, Globals.Cache);
+                return new RemoteFileSubscriptionStreamReader(_dataCacheProvider, source.Source, Globals.Cache, source.Headers);
             }
             catch (Exception err)
             {

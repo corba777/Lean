@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -127,10 +127,7 @@ namespace QuantConnect.Securities
         /// <returns>
         /// The number of elements contained in the <see cref="T:System.Collections.Generic.ICollection`1"/>.
         /// </returns>
-        public int Count
-        {
-            get { return _universes.Count; }
-        }
+        public int Count => _universes.Skip(0).Count();
 
         /// <summary>
         /// Gets a value indicating whether the <see cref="T:System.Collections.Generic.ICollection`1"/> is read-only.
@@ -163,14 +160,6 @@ namespace QuantConnect.Securities
         {
             if (_universes.TryAdd(key, universe))
             {
-                var userDefinedUniverse = universe as UserDefinedUniverse;
-                if (userDefinedUniverse != null)
-                {
-                    // wire up user defined universes to trigger
-                    userDefinedUniverse.CollectionChanged += (sender, args) => 
-                        OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Add, universe));
-                }
-
                 OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Add, universe));
             }
         }
@@ -227,7 +216,7 @@ namespace QuantConnect.Securities
                 Universe existing;
                 if (_universes.TryGetValue(symbol, out existing) && existing != value)
                 {
-                    throw new ArgumentException("Unable to over write existing Universe: " + symbol.ToString());
+                    throw new ArgumentException("Unable to over write existing Universe: " + symbol.Value);
                 }
 
                 // no security exists for the specified symbol key, add it now
@@ -244,10 +233,7 @@ namespace QuantConnect.Securities
         /// <returns>
         /// An <see cref="T:System.Collections.Generic.ICollection`1"/> containing the keys of the object that implements <see cref="T:System.Collections.Generic.IDictionary`2"/>.
         /// </returns>
-        public ICollection<Symbol> Keys
-        {
-            get { return _universes.Keys; }
-        }
+        public ICollection<Symbol> Keys => _universes.Select(x => x.Key).ToList();
 
         /// <summary>
         /// Gets an <see cref="T:System.Collections.Generic.ICollection`1"/> containing the values in the <see cref="T:System.Collections.Generic.IDictionary`2"/>.
@@ -255,10 +241,7 @@ namespace QuantConnect.Securities
         /// <returns>
         /// An <see cref="T:System.Collections.Generic.ICollection`1"/> containing the values in the object that implements <see cref="T:System.Collections.Generic.IDictionary`2"/>.
         /// </returns>
-        public ICollection<Universe> Values
-        {
-            get { return _universes.Values; }
-        }
+        public ICollection<Universe> Values => _universes.Select(x => x.Value).ToList();
 
         #endregion
 

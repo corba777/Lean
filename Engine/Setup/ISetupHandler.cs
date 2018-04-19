@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -34,10 +34,10 @@ namespace QuantConnect.Lean.Engine.Setup
         /// <summary>
         /// Any errors from the initialization stored here:
         /// </summary>
-        List<string> Errors 
-        { 
-            get; 
-            set; 
+        List<Exception> Errors
+        {
+            get;
+            set;
         }
 
         /// <summary>
@@ -76,17 +76,18 @@ namespace QuantConnect.Lean.Engine.Setup
         /// Create a new instance of an algorithm from a physical dll path.
         /// </summary>
         /// <param name="assemblyPath">The path to the assembly's location</param>
-        /// <param name="language">Language of the assembly.</param>
+        /// <param name="algorithmNodePacket">Details of the task required</param>
         /// <returns>A new instance of IAlgorithm, or throws an exception if there was an error</returns>
-        IAlgorithm CreateAlgorithmInstance(string assemblyPath, Language language);
+        IAlgorithm CreateAlgorithmInstance(AlgorithmNodePacket algorithmNodePacket, string assemblyPath);
 
         /// <summary>
         /// Creates the brokerage as specified by the job packet
         /// </summary>
         /// <param name="algorithmNodePacket">Job packet</param>
         /// <param name="uninitializedAlgorithm">The algorithm instance before Initialize has been called</param>
+        /// <param name="factory">The brokerage factory</param>
         /// <returns>The brokerage instance, or throws if error creating instance</returns>
-        IBrokerage CreateBrokerage(AlgorithmNodePacket algorithmNodePacket, IAlgorithm uninitializedAlgorithm);
+        IBrokerage CreateBrokerage(AlgorithmNodePacket algorithmNodePacket, IAlgorithm uninitializedAlgorithm, out IBrokerageFactory factory);
 
         /// <summary>
         /// Primary entry point to setup a new algorithm

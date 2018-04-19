@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,9 +21,9 @@ using System.Collections.Specialized;
 using System.Linq;
 using NodaTime;
 using QuantConnect.Data;
-using QuantConnect.Data.Market;
+using QuantConnect.Util;
 
-namespace QuantConnect.Securities 
+namespace QuantConnect.Securities
 {
     /// <summary>
     /// Enumerable security management class for grouping security objects into an array and providing any common properties.
@@ -140,10 +140,7 @@ namespace QuantConnect.Securities
         /// Count of the number of securities in the collection.
         /// </summary>
         /// <remarks>IDictionary implementation</remarks>
-        public int Count
-        {
-            get { return _securityManager.Count; }
-        }
+        public int Count => _securityManager.Skip(0).Count();
 
         /// <summary>
         /// Flag indicating if the internal arrray is read only.
@@ -185,10 +182,7 @@ namespace QuantConnect.Securities
         /// List of the symbol-keys in the collection of securities.
         /// </summary>
         /// <remarks>IDictionary implementation</remarks>
-        public ICollection<Symbol> Keys
-        {
-            get { return _securityManager.Keys; }
-        }
+        public ICollection<Symbol> Keys => _securityManager.Select(x => x.Key).ToList();
 
         /// <summary>
         /// Try and get this security object with matching symbol and return true on success.
@@ -206,17 +200,14 @@ namespace QuantConnect.Securities
         /// Get a list of the security objects for this collection.
         /// </summary>
         /// <remarks>IDictionary implementation</remarks>
-        public ICollection<Security> Values
-        {
-            get { return _securityManager.Values; }
-        }
+        public ICollection<Security> Values => _securityManager.Select(x => x.Value).ToList();
 
         /// <summary>
         /// Get the enumerator for this security collection.
         /// </summary>
         /// <remarks>IDictionary implementation</remarks>
         /// <returns>Enumerable key value pair</returns>
-        IEnumerator<KeyValuePair<Symbol, Security>> IEnumerable<KeyValuePair<Symbol, Security>>.GetEnumerator() 
+        IEnumerator<KeyValuePair<Symbol, Security>> IEnumerable<KeyValuePair<Symbol, Security>>.GetEnumerator()
         {
             return _securityManager.GetEnumerator();
         }
@@ -226,7 +217,7 @@ namespace QuantConnect.Securities
         /// </summary>
         /// <remarks>IDictionary implementation</remarks>
         /// <returns>Enumerator.</returns>
-        IEnumerator IEnumerable.GetEnumerator() 
+        IEnumerator IEnumerable.GetEnumerator()
         {
             return _securityManager.GetEnumerator();
         }
@@ -239,12 +230,12 @@ namespace QuantConnect.Securities
         /// <returns>Security</returns>
         public Security this[Symbol symbol]
         {
-            get 
+            get
             {
                 if (!_securityManager.ContainsKey(symbol))
                 {
                     throw new Exception(string.Format("This asset symbol ({0}) was not found in your security list. Please add this security or check it exists before using it with 'Securities.ContainsKey(\"{1}\")'", symbol, SymbolCache.GetTicker(symbol)));
-                } 
+                }
                 return _securityManager[symbol];
             }
             set
@@ -306,7 +297,7 @@ namespace QuantConnect.Securities
         /// leverage is less than or equal to zero.
         /// This method also add the new symbol mapping to the <see cref="SymbolCache"/>
         /// </summary>
-        public static Security CreateSecurity(Type factoryType,
+        public static Security CreateSecurity(List<Tuple<Type, TickType>> subscriptionDataTypes,
             SecurityPortfolioManager securityPortfolioManager,
             SubscriptionManager subscriptionManager,
             SecurityExchangeHours exchangeHours,
@@ -320,15 +311,29 @@ namespace QuantConnect.Securities
             bool extendedMarketHours,
             bool isInternalFeed,
             bool isCustomData,
+            bool isLiveMode,
             bool addToSymbolCache = true,
             bool isFilteredSubscription = true)
         {
+            if (!subscriptionDataTypes.Any())
+            {
+                throw new ArgumentNullException(nameof(subscriptionDataTypes), "At least one type needed to create security");
+            }
+
             // add the symbol to our cache
             if (addToSymbolCache) SymbolCache.Set(symbol.Value, symbol);
 
-            //Add the symbol to Data Manager -- generate unified data streams for algorithm events
-            var config = subscriptionManager.Add(factoryType, symbol, resolution, dataTimeZone, exchangeHours.TimeZone, isCustomData, fillDataForward,
-                extendedMarketHours, isInternalFeed, isFilteredSubscription);
+            // Add the symbol to Data Manager -- generate unified data streams for algorithm events
+            var configList = new SubscriptionDataConfigList(symbol);
+            configList.AddRange(from subscriptionDataType
+                                in subscriptionDataTypes
+                                let dataType = subscriptionDataType.Item1
+                                let tickType = subscriptionDataType.Item2
+                                select subscriptionManager.Add(dataType, tickType,
+                                                               symbol, resolution, dataTimeZone,
+                                                               exchangeHours.TimeZone, isCustomData,
+                                                               fillDataForward, extendedMarketHours,
+                                                               isInternalFeed, isFilteredSubscription));
 
             // verify the cash book is in a ready state
             var quoteCurrency = symbolProperties.QuoteCurrency;
@@ -337,7 +342,7 @@ namespace QuantConnect.Securities
                 // since we have none it's safe to say the conversion is zero
                 securityPortfolioManager.CashBook.Add(quoteCurrency, 0, 0);
             }
-            if (symbol.ID.SecurityType == SecurityType.Forex)
+            if (symbol.ID.SecurityType == SecurityType.Forex || symbol.ID.SecurityType == SecurityType.Crypto)
             {
                 // decompose the symbol into each currency pair
                 string baseCurrency;
@@ -354,18 +359,25 @@ namespace QuantConnect.Securities
                     securityPortfolioManager.CashBook.Add(quoteCurrency, 0, 0);
                 }
             }
-            
+
             var quoteCash = securityPortfolioManager.CashBook[symbolProperties.QuoteCurrency];
 
             Security security;
-            switch (config.SecurityType)
+            switch (configList.Symbol.ID.SecurityType)
             {
                 case SecurityType.Equity:
                     security = new Equity.Equity(symbol, exchangeHours, quoteCash, symbolProperties);
                     break;
 
                 case SecurityType.Option:
-                    security = new Option.Option(exchangeHours, config, securityPortfolioManager.CashBook[CashBook.AccountCurrency], symbolProperties);
+                    if (addToSymbolCache) SymbolCache.Set(symbol.Underlying.Value, symbol.Underlying);
+                    configList.SetDataNormalizationMode(DataNormalizationMode.Raw);
+                    security = new Option.Option(symbol, exchangeHours, securityPortfolioManager.CashBook[CashBook.AccountCurrency], new Option.OptionSymbolProperties(symbolProperties));
+                    break;
+
+                case SecurityType.Future:
+                    configList.SetDataNormalizationMode(DataNormalizationMode.Raw);
+                    security = new Future.Future(symbol, exchangeHours, securityPortfolioManager.CashBook[CashBook.AccountCurrency], symbolProperties);
                     break;
 
                 case SecurityType.Forex:
@@ -376,6 +388,10 @@ namespace QuantConnect.Securities
                     security = new Cfd.Cfd(symbol, exchangeHours, quoteCash, symbolProperties);
                     break;
 
+                case SecurityType.Crypto:
+                    security = new Crypto.Crypto(symbol, exchangeHours, quoteCash, symbolProperties);
+                    break;
+
                 default:
                 case SecurityType.Base:
                     security = new Security(symbol, exchangeHours, quoteCash, symbolProperties);
@@ -384,12 +400,12 @@ namespace QuantConnect.Securities
 
             // if we're just creating this security and it only has an internal
             // feed, mark it as non-tradable since the user didn't request this data
-            if (!config.IsInternalFeed)
+            if (!configList.IsInternalFeed)
             {
                 security.IsTradable = true;
             }
 
-            security.AddData(config);
+            security.AddData(configList);
 
             // invoke the security initializer
             securityInitializer.Initialize(security);
@@ -401,7 +417,59 @@ namespace QuantConnect.Securities
                 security.SetLeverage(leverage);
             }
 
+            // In live mode, equity assumes specific price variation model
+            if (isLiveMode && security.Type == SecurityType.Equity)
+            {
+                security.PriceVariationModel = new EquityPriceVariationModel();
+            }
+
             return security;
+        }
+
+        /// <summary>
+        /// Creates a security and matching configuration. This applies the default leverage if
+        /// leverage is less than or equal to zero.
+        /// This method also add the new symbol mapping to the <see cref="SymbolCache"/>
+        /// </summary>
+        public static Security CreateSecurity(Type dataType,
+            SecurityPortfolioManager securityPortfolioManager,
+            SubscriptionManager subscriptionManager,
+            SecurityExchangeHours exchangeHours,
+            DateTimeZone dataTimeZone,
+            SymbolProperties symbolProperties,
+            ISecurityInitializer securityInitializer,
+            Symbol symbol,
+            Resolution resolution,
+            bool fillDataForward,
+            decimal leverage,
+            bool extendedMarketHours,
+            bool isInternalFeed,
+            bool isCustomData,
+            bool isLiveMode,
+            bool addToSymbolCache = true,
+            bool isFilteredSubscription = true)
+        {
+            return CreateSecurity(
+                new List<Tuple<Type, TickType>>
+                {
+                    new Tuple<Type, TickType>(dataType, LeanData.GetCommonTickTypeForCommonDataTypes(dataType, symbol.SecurityType))
+                },
+                securityPortfolioManager,
+                subscriptionManager,
+                exchangeHours,
+                dataTimeZone,
+                symbolProperties,
+                securityInitializer,
+                symbol,
+                resolution,
+                fillDataForward,
+                leverage,
+                extendedMarketHours,
+                isInternalFeed,
+                isCustomData,
+                isLiveMode,
+                addToSymbolCache,
+                isFilteredSubscription);
         }
 
         /// <summary>
@@ -421,22 +489,21 @@ namespace QuantConnect.Securities
             bool extendedMarketHours,
             bool isInternalFeed,
             bool isCustomData,
-            bool addToSymbolCache = true)
+            bool isLiveMode,
+            bool addToSymbolCache = true
+            )
         {
-            var marketHoursDbEntry = marketHoursDatabase.GetEntry(symbol.ID.Market, symbol.Value, symbol.ID.SecurityType);
+            var marketHoursDbEntry = marketHoursDatabase.GetEntry(symbol.ID.Market, symbol, symbol.ID.SecurityType);
             var exchangeHours = marketHoursDbEntry.ExchangeHours;
 
             var defaultQuoteCurrency = CashBook.AccountCurrency;
-            if (symbol.ID.SecurityType == SecurityType.Forex) defaultQuoteCurrency = symbol.Value.Substring(3);
-            var symbolProperties = symbolPropertiesDatabase.GetSymbolProperties(symbol.ID.Market, symbol.Value, symbol.ID.SecurityType, defaultQuoteCurrency);
+            if (symbol.ID.SecurityType == SecurityType.Forex || symbol.ID.SecurityType == SecurityType.Crypto) defaultQuoteCurrency = symbol.Value.Substring(3);
+            var symbolProperties = symbolPropertiesDatabase.GetSymbolProperties(symbol.ID.Market, symbol, symbol.ID.SecurityType, defaultQuoteCurrency);
 
-            var type = resolution == Resolution.Tick ? typeof(Tick) : typeof(TradeBar);
-            if (symbol.ID.SecurityType == SecurityType.Option && resolution != Resolution.Tick)
-            {
-                type = typeof(QuoteBar);
-            }
-            return CreateSecurity(type, securityPortfolioManager, subscriptionManager, exchangeHours, marketHoursDbEntry.DataTimeZone, symbolProperties, securityInitializer, symbol, resolution,
-                fillDataForward, leverage, extendedMarketHours, isInternalFeed, isCustomData, addToSymbolCache);
+            var types = subscriptionManager.LookupSubscriptionConfigDataTypes(symbol.SecurityType, resolution, symbol.IsCanonical());
+
+            return CreateSecurity(types, securityPortfolioManager, subscriptionManager, exchangeHours, marketHoursDbEntry.DataTimeZone, symbolProperties, securityInitializer, symbol, resolution,
+                fillDataForward, leverage, extendedMarketHours, isInternalFeed, isCustomData, isLiveMode, addToSymbolCache);
         }
     }
 }

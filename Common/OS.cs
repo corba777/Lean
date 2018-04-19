@@ -17,6 +17,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 
 namespace QuantConnect 
 {
@@ -83,7 +84,8 @@ namespace QuantConnect
             {
                 if (_cpuUsageCounter == null)
                 {
-                    _cpuUsageCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
+                    _cpuUsageCounter = new PerformanceCounter("Process", "% Processor Time", 
+                        IsWindows ? Process.GetCurrentProcess().ProcessName : Process.GetCurrentProcess().Id.ToString());
                 }
                 return _cpuUsageCounter;
             }
@@ -167,8 +169,9 @@ namespace QuantConnect
         /// <returns></returns>
         private static DriveInfo GetDrive()
         {
-            var drives = DriveInfo.GetDrives();
-            return drives[0];
+            var assembly = Assembly.GetExecutingAssembly();
+            var drive = Path.GetPathRoot(assembly.Location);
+            return new DriveInfo(drive);
         }
 
         /// <summary>
@@ -223,6 +226,7 @@ namespace QuantConnect
                 {"Total RAM (MB)",        TotalPhysicalMemory.ToString()},
                 {"Used Disk Space (MB)", DriveSpaceUsed.ToString() },
                 {"Total Disk Space (MB)", DriveTotalSpace.ToString() },
+                { "Hostname", Environment.MachineName },
                 {"LEAN Version", "v" + Globals.Version}
             };
         }

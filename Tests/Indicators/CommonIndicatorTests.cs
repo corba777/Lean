@@ -15,6 +15,7 @@
 
 using System;
 using NUnit.Framework;
+using Python.Runtime;
 using QuantConnect.Data;
 using QuantConnect.Data.Market;
 using QuantConnect.Indicators;
@@ -22,7 +23,7 @@ using QuantConnect.Indicators;
 namespace QuantConnect.Tests.Indicators
 {
     public abstract class CommonIndicatorTests<T> 
-        where T : BaseData, new()
+        where T : IBaseData
     {
         [Test]
         public virtual void ComparesAgainstExternalData()
@@ -46,11 +47,23 @@ namespace QuantConnect.Tests.Indicators
             var indicator = CreateIndicator();
             if (indicator is IndicatorBase<IndicatorDataPoint>)
                 TestHelper.TestIndicatorReset(indicator as IndicatorBase<IndicatorDataPoint>, TestFileName);
+            else if (indicator is IndicatorBase<IBaseDataBar>)
+                TestHelper.TestIndicatorReset(indicator as IndicatorBase<IBaseDataBar>, TestFileName);
             else if (indicator is IndicatorBase<TradeBar>)
                 TestHelper.TestIndicatorReset(indicator as IndicatorBase<TradeBar>, TestFileName);
             else
                 throw new NotSupportedException("ResetsProperly: Unsupported indicator data type: " + typeof(T));
         }
+
+        public PyObject GetIndicatorAsPyObject()
+        {
+            using (Py.GIL())
+            {
+                return Indicator.ToPython();
+            }
+        }
+
+        public IndicatorBase<T> Indicator => CreateIndicator();
 
         /// <summary>
         /// Executes a test of the specified indicator
@@ -59,6 +72,8 @@ namespace QuantConnect.Tests.Indicators
         {
             if (indicator is IndicatorBase<IndicatorDataPoint>)
                 TestHelper.TestIndicator(indicator as IndicatorBase<IndicatorDataPoint>, TestFileName, TestColumnName, Assertion as Action<IndicatorBase<IndicatorDataPoint>, double>);
+            else if (indicator is IndicatorBase<IBaseDataBar>)
+                TestHelper.TestIndicator(indicator as IndicatorBase<IBaseDataBar>, TestFileName, TestColumnName, Assertion as Action<IndicatorBase<IBaseDataBar>, double>);
             else if (indicator is IndicatorBase<TradeBar>)
                 TestHelper.TestIndicator(indicator as IndicatorBase<TradeBar>, TestFileName, TestColumnName, Assertion as Action<IndicatorBase<TradeBar>, double>);
             else

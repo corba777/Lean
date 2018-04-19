@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -24,20 +24,19 @@ namespace QuantConnect.Data.Consolidators
     /// </summary>
     /// <typeparam name="TInput">The type consumed by the consolidator</typeparam>
     public abstract class DataConsolidator<TInput> : IDataConsolidator
-        where TInput : class, IBaseData
+        where TInput : IBaseData
     {
         /// <summary>
         /// Updates this consolidator with the specified data
         /// </summary>
         /// <param name="data">The new data for the consolidator</param>
-        public void Update(BaseData data)
+        public void Update(IBaseData data)
         {
-            var typedData = data as TInput;
-            if (typedData == null)
+            if (!(data is TInput))
             {
-                throw new ArgumentNullException("data", "Received type of " + data.GetType().Name + " but expected " + typeof(TInput).Name);
+                throw new ArgumentNullException("data", "Received type of " + data.GetType().Name + " but expected " + typeof (TInput).Name);
             }
-            Update(typedData);
+            Update((TInput)data);
         }
 
         /// <summary>
@@ -55,7 +54,7 @@ namespace QuantConnect.Data.Consolidators
         /// Gets the most recently consolidated piece of data. This will be null if this consolidator
         /// has not produced any data yet.
         /// </summary>
-        public BaseData Consolidated
+        public IBaseData Consolidated
         {
             get; private set;
         }
@@ -63,7 +62,7 @@ namespace QuantConnect.Data.Consolidators
         /// <summary>
         /// Gets a clone of the data being currently consolidated
         /// </summary>
-        public abstract BaseData WorkingData
+        public abstract IBaseData WorkingData
         {
             get;
         }
@@ -96,7 +95,7 @@ namespace QuantConnect.Data.Consolidators
         /// by derived classes when they have consolidated a new piece of data.
         /// </summary>
         /// <param name="consolidated">The newly consolidated data</param>
-        protected virtual void OnDataConsolidated(BaseData consolidated)
+        protected virtual void OnDataConsolidated(IBaseData consolidated)
         {
             var handler = DataConsolidated;
             if (handler != null) handler(this, consolidated);
@@ -105,6 +104,13 @@ namespace QuantConnect.Data.Consolidators
             // this allows the event handlers to look at the new consolidated data
             // and the previous consolidated data at the same time without extra bookkeeping
             Consolidated = consolidated;
+        }
+
+        /// <summary>Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.</summary>
+        /// <filterpriority>2</filterpriority>
+        public void Dispose()
+        {
+            DataConsolidated = null;
         }
     }
 }

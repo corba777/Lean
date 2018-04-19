@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,15 +18,13 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
-using System.IO;
 using System.Linq;
-using System.Net;
 using System.Runtime.Serialization;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using QuantConnect.Configuration;
+using QuantConnect.Interfaces;
 using QuantConnect.Logging;
 using QuantConnect.Orders;
 using QuantConnect.Securities;
@@ -37,21 +35,21 @@ using RestSharp;
 namespace QuantConnect.Brokerages.Tradier
 {
     /// <summary>
-    /// Tradier Class: 
+    /// Tradier Class:
     ///  - Handle authentication.
     ///  - Data requests.
     ///  - Rate limiting.
     ///  - Placing orders.
     ///  - Getting user data.
     /// </summary>
-    public class TradierBrokerage : Brokerage
+    public partial class TradierBrokerage : Brokerage, IDataQueueHandler, IHistoryProvider
     {
-        private readonly long _accountID;
+        private readonly string _accountID;
 
         // we're reusing the equity exchange here to grab typical exchange hours
         private static readonly EquityExchange Exchange =
-            new EquityExchange(MarketHoursDatabase.FromDataFolder().GetExchangeHours(Market.USA, null, SecurityType.Equity, TimeZones.NewYork));
-        
+            new EquityExchange(MarketHoursDatabase.FromDataFolder().GetExchangeHours(Market.USA, null, SecurityType.Equity));
+
         //Access and Refresh Tokens:
         private string _previousResponseRaw = "";
         private DateTime _issuedAt;
@@ -76,14 +74,14 @@ namespace QuantConnect.Brokerages.Tradier
         private readonly ConcurrentDictionary<long, TradierCachedOpenOrder> _cachedOpenOrdersByTradierOrderID;
         // this is used to block reentrance when doing look ups for orders with IDs we don't have cached
         private readonly HashSet<long> _reentranceGuardByTradierOrderID = new HashSet<long>();
-        private readonly FixedSizeHashQueue<long> _filledTradierOrderIDs = new FixedSizeHashQueue<long>(10000); 
+        private readonly FixedSizeHashQueue<long> _filledTradierOrderIDs = new FixedSizeHashQueue<long>(10000);
         // this is used to handle the zero crossing case, when the first order is filled we'll submit the next order
         private readonly ConcurrentDictionary<long, ContingentOrderQueue> _contingentOrdersByQCOrderID = new ConcurrentDictionary<long, ContingentOrderQueue>();
         // this is used to block reentrance when handling contingent orders
         private readonly HashSet<long> _contingentReentranceGuardByQCOrderID = new HashSet<long>();
-        private readonly HashSet<long> _unknownTradierOrderIDs = new HashSet<long>(); 
+        private readonly HashSet<long> _unknownTradierOrderIDs = new HashSet<long>();
         private readonly FixedSizeHashQueue<long> _verifiedUnknownTradierOrderIDs = new FixedSizeHashQueue<long>(1000);
-        private readonly FixedSizeHashQueue<int> _cancelledQcOrderIDs = new FixedSizeHashQueue<int>(10000);  
+        private readonly FixedSizeHashQueue<int> _cancelledQcOrderIDs = new FixedSizeHashQueue<int>(10000);
 
         /// <summary>
         /// Event fired when our session has been refreshed/tokens updated
@@ -124,7 +122,7 @@ namespace QuantConnect.Brokerages.Tradier
         /// <summary>
         /// Create a new Tradier Object:
         /// </summary>
-        public TradierBrokerage(IOrderProvider orderProvider, ISecurityProvider securityProvider, long accountID)
+        public TradierBrokerage(IOrderProvider orderProvider, ISecurityProvider securityProvider, string accountID)
             : base("Tradier Brokerage")
         {
             _orderProvider = orderProvider;
@@ -153,7 +151,7 @@ namespace QuantConnect.Brokerages.Tradier
         #region Tradier client implementation
 
         /// <summary>
-        /// Set the access token and login information for the tradier brokerage 
+        /// Set the access token and login information for the tradier brokerage
         /// </summary>
         /// <param name="userId">Userid for this brokerage</param>
         /// <param name="accessToken">Viable access token</param>
@@ -176,7 +174,7 @@ namespace QuantConnect.Brokerages.Tradier
             {
                 _orderFillTimer.Dispose();
             }
-            
+
             var dueTime = ExpectedExpiry - DateTime.UtcNow;
             if (dueTime < TimeSpan.Zero) dueTime = TimeSpan.Zero;
             var period = TimeSpan.FromDays(1).Subtract(TimeSpan.FromMinutes(-1));
@@ -269,11 +267,16 @@ namespace QuantConnect.Brokerages.Tradier
                                 OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "OrderAlreadyFilled",
                                     "Unable to cancel the order because it has already been filled. TradierOrderId: " + orderId
                                     ));
-
-                                
                             }
                             return new T();
                         }
+
+                        // this happens when a request for historical data should return an empty response
+                        if (type == TradierApiRequestType.Data && rootName == "series")
+                        {
+                            return new T();
+                        }
+
                         // Text Errors:
                         Log.Trace(method + "(2): Parameters: " + string.Join(",", parameters));
                         Log.Error(method + "(2): Response: " + raw.Content);
@@ -322,7 +325,11 @@ namespace QuantConnect.Brokerages.Tradier
         /// </summary>
         public bool RefreshSession()
         {
-            //Send: 
+            // if session refreshing disabled, do nothing
+            if (!Config.GetBool("tradier-refresh-session", true))
+                return true;
+
+            //Send:
             //Get: {"sAccessToken":"123123","iExpiresIn":86399,"dtIssuedAt":"2014-10-15T16:59:52-04:00","sRefreshToken":"123123","sScope":"read write market trade stream","sStatus":"approved","success":true}
             // Or: {"success":false}
             var raw = "";
@@ -400,7 +407,7 @@ namespace QuantConnect.Brokerages.Tradier
         /// Returns null if the request was unsucessful
         /// </remarks>
         /// <returns>Balance</returns>
-        public TradierBalanceDetails GetBalanceDetails(long accountId)
+        public TradierBalanceDetails GetBalanceDetails(string accountId)
         {
             var request = new RestRequest("accounts/{accountId}/balances", Method.GET);
             request.AddParameter("accountId", accountId, ParameterType.UrlSegment);
@@ -514,7 +521,7 @@ namespace QuantConnect.Brokerages.Tradier
         /// Place Order through API.
         /// accounts/{account-id}/orders
         /// </summary>
-        public TradierOrderResponse PlaceOrder(long accountId,
+        public TradierOrderResponse PlaceOrder(string accountId,
             TradierOrderClass classification,
             TradierOrderDirection direction,
             string symbol,
@@ -551,7 +558,7 @@ namespace QuantConnect.Brokerages.Tradier
         /// <summary>
         /// Update an exiting Tradier Order:
         /// </summary>
-        public TradierOrderResponse ChangeOrder(long accountId,
+        public TradierOrderResponse ChangeOrder(string accountId,
             long orderId,
             TradierOrderType type = TradierOrderType.Market,
             TradierOrderDuration duration = TradierOrderDuration.GTC,
@@ -577,7 +584,7 @@ namespace QuantConnect.Brokerages.Tradier
         /// <summary>
         /// Cancel the order with this account and id number
         /// </summary>
-        public TradierOrderResponse CancelOrder(long accountId, long orderId)
+        public TradierOrderResponse CancelOrder(string accountId, long orderId)
         {
             //Compose Request:
             var request = new RestRequest("accounts/{accountId}/orders/{orderId}");
@@ -590,7 +597,7 @@ namespace QuantConnect.Brokerages.Tradier
         }
 
         /// <summary>
-        /// List of quotes for symbols 
+        /// List of quotes for symbols
         /// </summary>
         public List<TradierQuote> GetQuotes(List<string> symbols)
         {
@@ -686,128 +693,6 @@ namespace QuantConnect.Brokerages.Tradier
         }
 
         /// <summary>
-        /// Get the current market status
-        /// </summary>
-        public TradierStreamSession CreateStreamSession()
-        {
-            var request = new RestRequest("markets/events/session", Method.POST);
-            return Execute<TradierStreamSession>(request, TradierApiRequestType.Data, "stream");
-        }
-
-        /// <summary>
-        /// Connect to tradier API strea:
-        /// </summary>
-        /// <param name="symbols">symbol list</param>
-        /// <returns></returns>
-        public IEnumerable<TradierStreamData> Stream(List<string> symbols)
-        {
-            bool success;
-            var symbolJoined = String.Join(",", symbols);
-            var session = CreateStreamSession();
-
-            if (session == null || session.SessionId == null || session.Url == null)
-            {
-                Log.Error("Tradier.Stream(): Failed to Created Stream Session", true);
-                yield break;
-            }
-            Log.Trace("Tradier.Stream(): Created Stream Session Id: " + session.SessionId + " Url:" + session.Url, true);
-
-
-            HttpWebRequest request;
-            do
-            {
-                //Connect to URL:
-                success = true;
-                request = (HttpWebRequest) WebRequest.Create(session.Url);
-
-                //Authenticate a request:
-                request.Accept = "application/json";
-                request.Headers.Add("Authorization", "Bearer " + AccessToken);
-
-                //Add the desired data:
-                var postData = "symbols=" + symbolJoined + "&sessionid=" + session.SessionId;
-                
-                var encodedData = Encoding.ASCII.GetBytes(postData);
-
-                //Set post:
-                request.Method = "POST";
-                request.ContentType = "application/x-www-form-urlencoded";
-                request.ContentLength = encodedData.Length;
-
-                //Send request:
-                try
-                {
-                    using (var postStream = request.GetRequestStream())
-                    {
-                        postStream.Write(encodedData, 0, encodedData.Length);
-                    }
-                }
-                catch (Exception err)
-                {
-                    Log.Error(err, "Failed to write session parameters to URL", true);
-                    success = false;
-                }
-            }
-            while (!success);
-
-            //Get response as a stream:
-            Log.Trace("Tradier.Stream(): Session Created, Reading Stream...", true);
-            var response = (HttpWebResponse) request.GetResponse();
-            var tradierStream = response.GetResponseStream();
-            if (tradierStream == null)
-            {
-                yield break;
-            }
-
-            using (var sr = new StreamReader(tradierStream))
-            using (var jsonReader = new JsonTextReader(sr))
-            {
-                var serializer = new JsonSerializer();
-                jsonReader.SupportMultipleContent = true;
-
-                // keep going until we fail to read more from the stream
-                while (true)
-                {
-                    bool successfulRead;
-                    try
-                    {
-                        //Read the jsonSocket in a safe manner: might close and so need handlers, but can't put handlers around a yield.
-                        successfulRead = jsonReader.Read();
-                    }
-                    catch (Exception err)
-                    {
-                        Log.Error(err);
-                        break;
-                    }
-
-                    if (!successfulRead)
-                    {
-                        // if we couldn't get a successful read just end the enumerable
-                        yield break;
-                    }
-
-                    //Have a Tradier JSON Object:
-                    TradierStreamData tsd = null;
-                    try
-                    {
-                        tsd = serializer.Deserialize<TradierStreamData>(jsonReader);
-                    }
-                    catch (Exception err)
-                    {
-                        // Do nothing for now. Can come back later to fix. Errors are from Tradier not properly json encoding values E.g. "NaN" string.
-                        Log.Error(err);
-                    }
-
-                    // don't yield garbage, just wait for the next one
-                    if (tsd != null)
-                    {
-                        yield return tsd;
-                    }
-                }
-            }
-        }
-
-        /// <summary>
         /// Convert the C# Enums back to the Tradier API Equivalent:
         /// </summary>
         private string GetEnumDescription(Enum value)
@@ -869,7 +754,7 @@ namespace QuantConnect.Brokerages.Tradier
         }
 
         /// <summary>
-        /// Gets all open orders on the account. 
+        /// Gets all open orders on the account.
         /// NOTE: The order objects returned do not have QC order IDs.
         /// </summary>
         /// <returns>The open orders returned from IB</returns>
@@ -877,7 +762,7 @@ namespace QuantConnect.Brokerages.Tradier
         {
             var orders = new List<Order>();
             var openOrders = GetIntradayAndPendingOrders().Where(OrderIsOpen);
-            
+
             foreach (var openOrder in openOrders)
             {
                 // make sure our internal collection is up to date as well
@@ -965,31 +850,6 @@ namespace QuantConnect.Brokerages.Tradier
                 }
             }
 
-
-            // tradier supports market on open by allowing placement of market orders after hours
-            // however, tradier does not support market on close orders, so we need to simulate it
-            // we'll place the market order at 3:59:45 PM, this allows 15 seconds for process and fill
-            if (order.Type == OrderType.MarketOnClose && DateTime.Now < DateTime.Today.Add(new TimeSpan(12+3, 59, 40))) // stop this behavior at 3:59:40
-            {
-                // just recall this PlaceOrder function so it can go through the normal path
-                Timer t = null;
-                t = new Timer(state =>
-                {
-                    PlaceOrder(order);
-                    // be sure to dispose of this
-                    t.Dispose();
-                });
-
-                // Figure how much time until 3:59:45
-                var now = DateTime.Now;
-                var placeOrderTime = now.Date.Add(new TimeSpan(12+3, 59, 45));
-
-                // set timer for delta between now and when we want it to execute
-                int milliseconds = (int)((placeOrderTime - now).TotalMilliseconds);
-                t.Change(milliseconds, Timeout.Infinite);
-                // even though 't' goes out of scope here, the internal scheduler (TimerQueue) maintains a reference
-            }
-
             var holdingQuantity = _securityProvider.GetHoldingsQuantity(order.Symbol);
 
             var orderRequest = new TradierPlaceOrderRequest(order, TradierOrderClass.Equity,  holdingQuantity);
@@ -1062,7 +922,7 @@ namespace QuantConnect.Brokerages.Tradier
                 where _cachedOpenOrdersByTradierOrderID.ContainsKey(id)
                 select _cachedOpenOrdersByTradierOrderID[id]
                 ).SingleOrDefault();
-            
+
             if (activeOrder == null)
             {
                 Log.Trace("Unable to locate active Tradier order for QC order id: " + order.Id + " with Tradier ids: " + string.Join(", ", order.BrokerId));
@@ -1104,7 +964,7 @@ namespace QuantConnect.Brokerages.Tradier
                 OnMessage(new BrokerageMessageEvent(BrokerageMessageType.Warning, "UpdateFailed", "Failed to update Tradier order id: " + activeOrder.Order.Id + ". " + errors));
                 return false;
             }
-            
+
             // success
             OnOrderEvent(new OrderEvent(order, DateTime.UtcNow, 0) {Status = OrderStatus.Submitted});
 
@@ -1173,6 +1033,7 @@ namespace QuantConnect.Brokerages.Tradier
         /// </summary>
         public override void Connect()
         {
+            _disconnect = false;
             if (IsConnected) return;
             RefreshSession();
         }
@@ -1182,7 +1043,7 @@ namespace QuantConnect.Brokerages.Tradier
         /// </summary>
         public override void Disconnect()
         {
-            // NOP - token will eventually expire
+            _disconnect = true;
         }
 
         /// <summary>
@@ -1207,17 +1068,17 @@ namespace QuantConnect.Brokerages.Tradier
             string stopLimit = string.Empty;
             if (order.Price != 0 || order.Stop != 0)
             {
-                stopLimit = string.Format(" at{0}{1}", 
-                    order.Stop == 0 ? "" : " stop " + order.Stop, 
+                stopLimit = string.Format(" at{0}{1}",
+                    order.Stop == 0 ? "" : " stop " + order.Stop,
                     order.Price == 0 ? "" : " limit " + order.Price
                     );
             }
 
-            Log.Trace(string.Format("TradierBrokerage.TradierPlaceOrder(): {0} to {1} {2} units of {3}{4}", 
+            Log.Trace(string.Format("TradierBrokerage.TradierPlaceOrder(): {0} to {1} {2} units of {3}{4}",
                 order.Type, order.Direction, order.Quantity, order.Symbol, stopLimit)
                 );
- 
-            var response = PlaceOrder(_accountID, 
+
+            var response = PlaceOrder(_accountID,
                 order.Classification,
                 order.Direction,
                 order.Symbol,
@@ -1343,7 +1204,7 @@ namespace QuantConnect.Brokerages.Tradier
                         continue;
                     }
 
-                    // if we made it here this may be a canceled order via another portal, so we need to figure this one 
+                    // if we made it here this may be a canceled order via another portal, so we need to figure this one
                     // out with its own rest call, do this async to not block this thread
                     if (!_reentranceGuardByTradierOrderID.Add(cachedOrder.Key))
                     {
@@ -1640,7 +1501,7 @@ namespace QuantConnect.Brokerages.Tradier
                 case TradierOrderType.StopLimit:
                     qcOrder = new StopLimitOrder {LimitPrice = order.Price, StopPrice = GetOrder(order.Id).StopPrice};
                     break;
-                
+
                 //case TradierOrderType.Credit:
                 //case TradierOrderType.Debit:
                 //case TradierOrderType.Even:
@@ -1670,8 +1531,6 @@ namespace QuantConnect.Brokerages.Tradier
             switch (type)
             {
                 case OrderType.Market:
-                case OrderType.MarketOnOpen:
-                case OrderType.MarketOnClose:
                     return TradierOrderType.Market;
 
                 case OrderType.Limit:
@@ -1748,22 +1607,22 @@ namespace QuantConnect.Brokerages.Tradier
 
                 case OrderStatus.Submitted:
                     return TradierOrderStatus.Submitted;
-                    
+
                 case OrderStatus.PartiallyFilled:
                     return TradierOrderStatus.PartiallyFilled;
-                
+
                 case OrderStatus.Filled:
                     return TradierOrderStatus.Filled;
-                
+
                 case OrderStatus.Canceled:
                     return TradierOrderStatus.Canceled;
-                
+
                 case OrderStatus.None:
                     return TradierOrderStatus.Pending;
-                
+
                 case OrderStatus.Invalid:
                     return TradierOrderStatus.Rejected;
-                
+
                 default:
                     throw new ArgumentOutOfRangeException("status", status, null);
             }
@@ -1920,7 +1779,7 @@ namespace QuantConnect.Brokerages.Tradier
                 case OrderType.StopLimit:
                     return TradierOrderType.StopLimit;
                 default:
-                    throw new ArgumentOutOfRangeException();
+                    throw new ArgumentOutOfRangeException("type", order.Type, order.Type + " not supported");
             }
         }
 

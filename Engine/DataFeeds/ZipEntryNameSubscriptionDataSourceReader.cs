@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -15,9 +15,9 @@
 
 using System;
 using System.Collections.Generic;
-using System.IO;
 using Ionic.Zip;
 using QuantConnect.Data;
+using QuantConnect.Util;
 
 namespace QuantConnect.Lean.Engine.DataFeeds
 {
@@ -27,7 +27,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
     public class ZipEntryNameSubscriptionDataSourceReader : ISubscriptionDataSourceReader
     {
         private readonly SubscriptionDataConfig _config;
-        private readonly DateTime _dateTime;
+        private readonly DateTime _date;
         private readonly bool _isLiveMode;
         private readonly BaseData _factory;
 
@@ -41,14 +41,14 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// Initializes a new instance of the <see cref="ZipEntryNameSubscriptionDataSourceReader"/> class
         /// </summary>
         /// <param name="config">The subscription's configuration</param>
-        /// <param name="dateTime">The date this factory was produced to read data for</param>
+        /// <param name="date">The date this factory was produced to read data for</param>
         /// <param name="isLiveMode">True if we're in live mode, false for backtesting</param>
-        public ZipEntryNameSubscriptionDataSourceReader(SubscriptionDataConfig config, DateTime dateTime, bool isLiveMode)
+        public ZipEntryNameSubscriptionDataSourceReader(SubscriptionDataConfig config, DateTime date, bool isLiveMode)
         {
             _config = config;
-            _dateTime = dateTime;
+            _date = date;
             _isLiveMode = isLiveMode;
-            _factory = (BaseData) Activator.CreateInstance(config.Type);
+            _factory = _factory = (BaseData)ObjectActivator.GetActivator(config.Type).Invoke(new object[] { config.Type });
         }
 
         /// <summary>
@@ -58,15 +58,13 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// <returns>An <see cref="IEnumerable{BaseData}"/> that contains the data in the source</returns>
         public IEnumerable<BaseData> Read(SubscriptionDataSource source)
         {
-            if (!File.Exists(source.Source))
-            {
-                OnInvalidSource(source, new FileNotFoundException("The specified file was not found", source.Source));
-            }
-
-            ZipFile zip;
+            ICollection<string> entryNames;
             try
             {
-                zip = new ZipFile(source.Source);
+                using (var zip = new ZipFile(source.Source))
+                {
+                    entryNames = zip.EntryFileNames;
+                }
             }
             catch (ZipException err)
             {
@@ -74,9 +72,13 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 yield break;
             }
 
-            foreach (var entryFileName in zip.EntryFileNames)
+            foreach (var entryFileName in entryNames)
             {
-                yield return _factory.Reader(_config, entryFileName, _dateTime, _isLiveMode);
+                var instance = _factory.Reader(_config, entryFileName, _date, _isLiveMode);
+                if (instance != null && instance.EndTime != default(DateTime))
+                {
+                    yield return instance;
+                }
             }
         }
 
@@ -87,8 +89,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// <param name="exception">The exception if one was raised, otherwise null</param>
         private void OnInvalidSource(SubscriptionDataSource source, Exception exception)
         {
-            var handler = InvalidSource;
-            if (handler != null) handler(this, new InvalidSourceEventArgs(source, exception));
+            InvalidSource?.Invoke(this, new InvalidSourceEventArgs(source, exception));
         }
     }
 }

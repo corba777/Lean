@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -38,11 +38,16 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
         private IBrokerage _brokerage;
         private bool _syncedLiveBrokerageCashToday;
 
+        // this bool is used to check if the warning message for the rounding of order quantity has been displayed for the first time
+        private bool _firstRoundOffMessage = false;
+
         // this value is used for determining how confident we are in our cash balance update
         private long _lastFillTimeTicks;
         private long _lastSyncTimeTicks;
         private readonly object _performCashSyncReentranceGuard = new object();
-        private static readonly TimeSpan _liveBrokerageCashSyncTime = new TimeSpan(7, 45, 0); // 7:45 am
+
+        // 7:45 AM (New York time zone)
+        private static readonly TimeSpan LiveBrokerageCashSyncTime = new TimeSpan(7, 45, 0);
 
         /// <summary>
         /// OrderQueue holds the newly updated orders from the user algorithm waiting to be processed. Once
@@ -75,6 +80,14 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
         }
 
         /// <summary>
+        /// Gets the permanent storage for all order tickets
+        /// </summary>
+        public ConcurrentDictionary<int, OrderTicket> OrderTickets
+        {
+            get { return _orderTickets; }
+        }
+
+        /// <summary>
         /// Gets the current number of orders that have been processed
         /// </summary>
         public int OrdersCount
@@ -98,7 +111,7 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
             // we don't need to do this today because we just initialized/synced
             _resultHandler = resultHandler;
             _syncedLiveBrokerageCashToday = true;
-            _lastSyncTimeTicks = DateTime.Now.Ticks;
+            _lastSyncTimeTicks = DateTime.UtcNow.Ticks;
 
             _brokerage = brokerage;
             _brokerage.OrderStatusChanged += (sender, fill) =>
@@ -120,13 +133,18 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                 HandleAccountChanged(account);
             };
 
+            _brokerage.OptionPositionAssigned += (sender, fill) =>
+            {
+                HandlePositionAssigned(fill);
+            };
+
             IsActive = true;
 
             _algorithm = algorithm;
         }
 
         /// <summary>
-        /// Boolean flag indicating the Run thread method is busy. 
+        /// Boolean flag indicating the Run thread method is busy.
         /// False indicates it is completely finished processing and ready to be terminated.
         /// </summary>
         public bool IsActive { get; private set; }
@@ -168,7 +186,7 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
         public OrderTicket AddOrder(SubmitOrderRequest request)
         {
             var response = !_algorithm.IsWarmingUp
-                ? OrderResponse.Success(request) 
+                ? OrderResponse.Success(request)
                 : OrderResponse.WarmingUp(request);
 
             request.SetResponse(response);
@@ -295,6 +313,12 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                 }
                 else
                 {
+                    // update the order status
+                    order.Status = OrderStatus.CancelPending;
+
+                    // notify the algorithm with an order event
+                    HandleOrderEvent(new OrderEvent(order, _algorithm.UtcTime, 0m));
+
                     // send the request to be processed
                     request.SetResponse(OrderResponse.Success(request), OrderRequestStatus.Processing);
                     _orderRequestQueue.Add(request);
@@ -348,7 +372,7 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
         {
             // this function can be invoked by brokerages when getting open orders, guard against null ref
             if (_orders == null) return null;
-            
+
             Order order;
             return _orders.TryGetValue(orderId, out order) ? order : null;
         }
@@ -362,7 +386,7 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
         {
             // this function can be invoked by brokerages when getting open orders, guard against null ref
             if (_orders == null) return null;
-            
+
             var order = _orders.FirstOrDefault(x => x.Value.BrokerId.Contains(brokerageId)).Value;
             return order != null ? order.Clone() : null;
         }
@@ -398,25 +422,7 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
             {
                 foreach(var request in _orderRequestQueue.GetConsumingEnumerable(_cancellationTokenSource.Token))
                 {
-                    OrderResponse response;
-                    switch (request.OrderRequestType)
-                    {
-                        case OrderRequestType.Submit:
-                            response = HandleSubmitOrderRequest((SubmitOrderRequest) request);
-                            break;
-                        case OrderRequestType.Update:
-                            response = HandleUpdateOrderRequest((UpdateOrderRequest) request);
-                            break;
-                        case OrderRequestType.Cancel:
-                            response = HandleCancelOrderRequest((CancelOrderRequest) request);
-                            break;
-                        default:
-                            throw new ArgumentOutOfRangeException();
-                    }
-
-                    // we've finally finished processing the request, mark as processed
-                    request.SetResponse(response, OrderRequestStatus.Processed);
-
+                    HandleOrderRequest(request);
                     ProcessAsynchronousEvents();
                 }
             }
@@ -460,13 +466,14 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
             Log.Debug("BrokerageTransactionHandler.ProcessSynchronousEvents(): Enter");
 
             // every morning flip this switch back
-            if (_syncedLiveBrokerageCashToday && DateTime.Now.Date != LastSyncDate)
+            var currentTimeNewYork = DateTime.UtcNow.ConvertFromUtc(TimeZones.NewYork);
+            if (_syncedLiveBrokerageCashToday && currentTimeNewYork.Date != LastSyncDate)
             {
                 _syncedLiveBrokerageCashToday = false;
             }
 
             // we want to sync up our cash balance before market open
-            if (_algorithm.LiveMode && !_syncedLiveBrokerageCashToday && DateTime.Now.TimeOfDay >= _liveBrokerageCashSyncTime)
+            if (_algorithm.LiveMode && !_syncedLiveBrokerageCashToday && currentTimeNewYork.TimeOfDay >= LiveBrokerageCashSyncTime)
             {
                 try
                 {
@@ -532,25 +539,43 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                 {
                     return;
                 }
-                
-                // if we were returned our balances, update everything and flip our flag as having performed sync today
+
+                //Adds currency to the cashbook that the user might have deposited
                 foreach (var balance in balances)
                 {
                     Cash cash;
-                    if (_algorithm.Portfolio.CashBook.TryGetValue(balance.Symbol, out cash))
+                    if (!_algorithm.Portfolio.CashBook.TryGetValue(balance.Symbol, out cash))
                     {
-                        // compare in dollars
-                        var delta = cash.Amount - balance.Amount;
-                        if (Math.Abs(delta) > _algorithm.Portfolio.CashBook.ConvertToAccountCurrency(delta, cash.Symbol))
-                        {
-                            // log the delta between 
-                            Log.LogHandler.Trace("BrokerageTransactionHandler.PerformCashSync(): {0} Delta: {1}", balance.Symbol,
-                                delta.ToString("0.00"));
-                        }
+                        Log.LogHandler.Trace("BrokerageTransactionHandler.PerformCashSync(): Unexpected cash found {0} {1}", balance.Amount, balance.Symbol);
+                        _algorithm.Portfolio.SetCash(balance.Symbol, balance.Amount, balance.ConversionRate);
                     }
-                    _algorithm.Portfolio.SetCash(balance.Symbol, balance.Amount, balance.ConversionRate);
                 }
 
+                // if we were returned our balances, update everything and flip our flag as having performed sync today
+                foreach (var kvp in _algorithm.Portfolio.CashBook)
+                {
+                    var cash = kvp.Value;
+
+                    var balanceCash = balances.FirstOrDefault(balance => balance.Symbol == cash.Symbol);
+                    //update the cash if the entry if found in the balances
+                    if (balanceCash != null)
+                    {
+                        // compare in dollars
+                        var delta = cash.Amount - balanceCash.Amount;
+                        if (Math.Abs(_algorithm.Portfolio.CashBook.ConvertToAccountCurrency(delta, cash.Symbol)) > 5)
+                        {
+                            // log the delta between
+                            Log.LogHandler.Trace("BrokerageTransactionHandler.PerformCashSync(): {0} Delta: {1}", balanceCash.Symbol,
+                                delta.ToString("0.00"));
+                        }
+                        _algorithm.Portfolio.SetCash(balanceCash.Symbol, balanceCash.Amount, balanceCash.ConversionRate);
+                    }
+                    else
+                    {
+                        //Set the cash amount to zero if cash entry not found in the balances
+                        _algorithm.Portfolio.SetCash(cash.Symbol, 0, cash.ConversionRate);
+                    }
+                }
                 _syncedLiveBrokerageCashToday = true;
             }
             finally
@@ -565,14 +590,14 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                 // we want to make sure this is a good value, so check for any recent fills
                 if (TimeSinceLastFill <= TimeSpan.FromSeconds(20))
                 {
-                    // this will cause us to come back in and reset cash again until we 
+                    // this will cause us to come back in and reset cash again until we
                     // haven't processed a fill for +- 10 seconds of the set cash time
                     _syncedLiveBrokerageCashToday = false;
                     Log.Trace("BrokerageTransactionHandler.PerformCashSync(): Unverified cash sync - resync required.");
                 }
                 else
                 {
-                    _lastSyncTimeTicks = DateTime.Now.Ticks;
+                    _lastSyncTimeTicks = DateTime.UtcNow.Ticks;
                     Log.Trace("BrokerageTransactionHandler.PerformCashSync(): Verified cash sync.");
                 }
             });
@@ -592,6 +617,33 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
         }
 
         /// <summary>
+        /// Handles a generic order request
+        /// </summary>
+        /// <param name="request"><see cref="OrderRequest"/> to be handled</param>
+        /// <returns><see cref="OrderResponse"/> for request</returns>
+        public void HandleOrderRequest(OrderRequest request)
+        {
+            OrderResponse response;
+            switch (request.OrderRequestType)
+            {
+                case OrderRequestType.Submit:
+                    response = HandleSubmitOrderRequest((SubmitOrderRequest)request);
+                    break;
+                case OrderRequestType.Update:
+                    response = HandleUpdateOrderRequest((UpdateOrderRequest)request);
+                    break;
+                case OrderRequestType.Cancel:
+                    response = HandleCancelOrderRequest((CancelOrderRequest)request);
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+
+            // mark request as processed
+            request.SetResponse(response, OrderRequestStatus.Processed);
+        }
+
+        /// <summary>
         /// Handles a request to submit a new order
         /// </summary>
         private OrderResponse HandleSubmitOrderRequest(SubmitOrderRequest request)
@@ -602,6 +654,9 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
             // ensure the order is tagged with a currency
             var security = _algorithm.Securities[order.Symbol];
             order.PriceCurrency = security.SymbolProperties.QuoteCurrency;
+
+            // rounds off the order towards 0 to the nearest multiple of lot size
+            order.Quantity = RoundOffOrder(order, security);
 
             if (!_orders.TryAdd(order.Id, order))
             {
@@ -614,14 +669,29 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                 return OrderResponse.UnableToFindOrder(request);
             }
 
+            // rounds the order prices
+            RoundOrderPrices(order, security);
+
+            // save current security time and prices
+            order.OrderSubmissionData = new OrderSubmissionData(security.GetLastData());
+
             // update the ticket's internal storage with this new order reference
             ticket.SetOrder(order);
 
+            if (order.Quantity == 0)
+            {
+                order.Status = OrderStatus.Invalid;
+                var response = OrderResponse.ZeroQuantity(request);
+                _algorithm.Error(response.ErrorMessage);
+                HandleOrderEvent(new OrderEvent(order, _algorithm.UtcTime, 0m, "Unable to add order for zero quantity"));
+                return response;
+            }
+
             // check to see if we have enough money to place the order
-            bool sufficientCapitalForOrder;
+            HasSufficientBuyingPowerForOrderResult hasSufficientBuyingPowerResult;
             try
             {
-                sufficientCapitalForOrder = _algorithm.Transactions.GetSufficientCapitalForOrder(_algorithm.Portfolio, order);
+                hasSufficientBuyingPowerResult = security.BuyingPowerModel.HasSufficientBuyingPowerForOrder(_algorithm.Portfolio, security, order);
             }
             catch (Exception err)
             {
@@ -631,18 +701,19 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                 return OrderResponse.Error(request, OrderResponseErrorCode.ProcessingError, "Error in GetSufficientCapitalForOrder");
             }
 
-            if (!sufficientCapitalForOrder)
+            if (!hasSufficientBuyingPowerResult.IsSufficient)
             {
                 order.Status = OrderStatus.Invalid;
-                var response = OrderResponse.Error(request, OrderResponseErrorCode.InsufficientBuyingPower, string.Format("Order Error: id: {0}, Insufficient buying power to complete order (Value:{1}).", order.Id, order.GetValue(security).SmartRounding()));
+                var errorMessage = $"Order Error: id: {order.Id}, Insufficient buying power to complete order (Value:{order.GetValue(security).SmartRounding()}), Reason: {hasSufficientBuyingPowerResult.Reason}";
+                var response = OrderResponse.Error(request, OrderResponseErrorCode.InsufficientBuyingPower, errorMessage);
                 _algorithm.Error(response.ErrorMessage);
-                HandleOrderEvent(new OrderEvent(order, _algorithm.UtcTime, 0m, "Insufficient buying power to complete order"));
+                HandleOrderEvent(new OrderEvent(order, _algorithm.UtcTime, 0m, errorMessage));
                 return response;
             }
 
             // verify that our current brokerage can actually take the order
             BrokerageMessageEvent message;
-            if (!_algorithm.LiveMode && !_algorithm.BrokerageModel.CanSubmitOrder(security, order, out message))
+            if (!_algorithm.BrokerageModel.CanSubmitOrder(security, order, out message))
             {
                 // if we couldn't actually process the order, mark it as invalid and bail
                 order.Status = OrderStatus.Invalid;
@@ -663,7 +734,7 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
             {
                 Log.Error(err);
                 orderPlaced = false;
-             }
+            }
 
             if (!orderPlaced)
             {
@@ -675,8 +746,7 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                 HandleOrderEvent(new OrderEvent(order, _algorithm.UtcTime, 0m, "Brokerage failed to place order"));
                 return response;
             }
-            
-            order.Status = OrderStatus.Submitted;
+
             return OrderResponse.Success(request);
         }
 
@@ -692,11 +762,15 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                 Log.Error("BrokerageTransactionHandler.HandleUpdateOrderRequest(): Unable to update order with ID " + request.OrderId);
                 return OrderResponse.UnableToFindOrder(request);
             }
-            
+
             if (!CanUpdateOrder(order))
             {
                 return OrderResponse.InvalidStatus(request, order);
             }
+
+            // rounds off the order towards 0 to the nearest multiple of lot size
+            var security = _algorithm.Securities[order.Symbol];
+            order.Quantity = RoundOffOrder(order, security);
 
             // verify that our current brokerage can actually update the order
             BrokerageMessageEvent message;
@@ -713,6 +787,10 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
 
             // modify the values of the order object
             order.ApplyUpdateOrderRequest(request);
+
+            // rounds the order prices
+            RoundOrderPrices(order, security);
+
             ticket.SetOrder(order);
 
             bool orderUpdated;
@@ -725,7 +803,7 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                 Log.Error(err);
                 orderUpdated = false;
             }
-            
+
             if (!orderUpdated)
             {
                 // we failed to update the order for some reason
@@ -824,8 +902,8 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
             //Apply the filled order to our portfolio:
             if (fill.Status == OrderStatus.Filled || fill.Status == OrderStatus.PartiallyFilled)
             {
-                Interlocked.Exchange(ref _lastFillTimeTicks, DateTime.Now.Ticks);
-                
+                Interlocked.Exchange(ref _lastFillTimeTicks, DateTime.UtcNow.Ticks);
+
                 // check if the fill currency and the order currency match the symbol currency
                 var security = _algorithm.Securities[fill.Symbol];
                 // Bug in FXCM API flipping the currencies -- disabling for now. 5/17/16 RFB
@@ -843,8 +921,9 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                     _algorithm.Portfolio.ProcessFill(fill);
 
                     var conversionRate = security.QuoteCurrency.ConversionRate;
+                    var multiplier = security.SymbolProperties.ContractMultiplier;
 
-                    _algorithm.TradeBuilder.ProcessFill(fill, conversionRate);
+                    _algorithm.TradeBuilder.ProcessFill(fill, conversionRate, multiplier);
                 }
                 catch (Exception err)
                 {
@@ -898,9 +977,24 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
                 Log.Trace(string.Format("BrokerageTransactionHandler.HandleAccountChanged(): {0} Cash Delta: {1}", account.CurrencySymbol, delta));
             }
 
-            // we don't actually want to do this, this data can be delayed
-            // override the current cash value to we're always gauranted to be in sync with the brokerage's push updates
-            //_algorithm.Portfolio.CashBook[account.CurrencySymbol].Quantity = account.CashBalance;
+            // maybe we don't actually want to do this, this data can be delayed. Must be explicitly supported by brokerage
+            if (_brokerage.AccountInstantlyUpdated)
+            {
+                // override the current cash value so we're always guaranteed to be in sync with the brokerage's push updates
+                _algorithm.Portfolio.CashBook[account.CurrencySymbol].SetAmount(account.CashBalance);
+            }
+        }
+
+        /// <summary>
+        /// Option assignment/exercise event is received and propagated to the user algo
+        /// </summary>
+        private void HandlePositionAssigned(OrderEvent fill)
+        {
+            // informing user algorithm that option position has been assigned
+            if (fill.IsAssignment)
+            {
+                _algorithm.OnAssignmentOrderEvent(fill);
+            }
         }
 
         /// <summary>
@@ -908,15 +1002,102 @@ namespace QuantConnect.Lean.Engine.TransactionHandlers
         /// </summary>
         private TimeSpan TimeSinceLastFill
         {
-            get { return DateTime.Now - new DateTime(Interlocked.Read(ref _lastFillTimeTicks)); }
+            get { return DateTime.UtcNow - new DateTime(Interlocked.Read(ref _lastFillTimeTicks)); }
         }
 
         /// <summary>
-        /// Gets the date of the last sync
+        /// Gets the date of the last sync (New York time zone)
         /// </summary>
         private DateTime LastSyncDate
         {
-            get { return new DateTime(Interlocked.Read(ref _lastSyncTimeTicks)).Date; }
+            get { return new DateTime(Interlocked.Read(ref _lastSyncTimeTicks)).ConvertFromUtc(TimeZones.NewYork).Date; }
+        }
+
+        /// <summary>
+        /// Rounds off the order towards 0 to the nearest multiple of Lot Size
+        /// </summary>
+        public decimal RoundOffOrder(Order order, Security security)
+        {
+            var orderLotMod = order.Quantity % security.SymbolProperties.LotSize;
+
+            if (orderLotMod != 0)
+            {
+                order.Quantity = order.Quantity - orderLotMod;
+
+                if (!_firstRoundOffMessage)
+                {
+                    _algorithm.Error(
+                        string.Format(
+                            "Warning: Due to brokerage limitations, orders will be rounded to the nearest lot size of {0}",
+                            security.SymbolProperties.LotSize));
+                    _firstRoundOffMessage = true;
+                }
+                return order.Quantity;
+            }
+            else
+            {
+                return order.Quantity;
+            }
+        }
+
+        /// <summary>
+        /// Rounds the order prices to its security minimum price variation.
+        /// <remarks>
+        /// This procedure is needed to meet brokerage precision requirements.
+        /// </remarks>
+        /// </summary>
+        private void RoundOrderPrices(Order order, Security security)
+        {
+            // Do not need to round market orders
+            if (order.Type == OrderType.Market ||
+                order.Type == OrderType.MarketOnOpen ||
+                order.Type == OrderType.MarketOnClose)
+            {
+                return;
+            }
+
+            var increment = security.PriceVariationModel.GetMinimumPriceVariation(security);
+            if (increment == 0) return;
+
+            var limitPrice = 0m;
+            var limitRound = 0m;
+            var stopPrice = 0m;
+            var stopRound = 0m;
+
+            switch (order.Type)
+            {
+                case OrderType.Limit:
+                    limitPrice = ((LimitOrder)order).LimitPrice;
+                    limitRound = Math.Round(limitPrice / increment) * increment;
+                    ((LimitOrder)order).LimitPrice = limitRound;
+                    break;
+                case OrderType.StopMarket:
+                    stopPrice = ((StopMarketOrder)order).StopPrice;
+                    stopRound = Math.Round(stopPrice / increment) * increment;
+                    ((StopMarketOrder)order).StopPrice = stopRound;
+                    break;
+                case OrderType.StopLimit:
+                    limitPrice = ((StopLimitOrder)order).LimitPrice;
+                    limitRound = Math.Round(limitPrice / increment) * increment;
+                    ((StopLimitOrder)order).LimitPrice = limitRound;
+                    stopPrice = ((StopLimitOrder)order).StopPrice;
+                    stopRound = Math.Round(stopPrice / increment) * increment;
+                    ((StopLimitOrder)order).StopPrice = stopRound;
+                    break;
+                default:
+                    break;
+            }
+
+            var format = "Warning: To meet brokerage precision requirements, order {0}Price was rounded to {1} from {2}";
+
+            if (!limitPrice.Equals(limitRound))
+            {
+                _algorithm.Error(string.Format(format, "Limit", limitRound, limitPrice));
+            }
+            if (!stopPrice.Equals(stopRound))
+            {
+                _algorithm.Error(string.Format(format, "Stop", stopRound, stopPrice));
+            }
         }
     }
 }

@@ -1,11 +1,11 @@
 /*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -20,6 +20,9 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using QuantConnect.Data;
+using System.Collections.Concurrent;
+using QuantConnect.Data.UniverseSelection;
+using QuantConnect.Logging;
 
 namespace QuantConnect.Securities
 {
@@ -28,20 +31,19 @@ namespace QuantConnect.Securities
     /// </summary>
     public class CashBook : IDictionary<string, Cash>
     {
-
         /// <summary>
         /// Gets the base currency used
         /// </summary>
         public const string AccountCurrency = "USD";
 
-        private readonly Dictionary<string, Cash> _currencies;
+        private readonly ConcurrentDictionary<string, Cash> _currencies;
 
         /// <summary>
         /// Gets the total value of the cash book in units of the base currency
         /// </summary>
         public decimal TotalValueInAccountCurrency
         {
-            get { return _currencies.Values.Sum(x => x.ValueInAccountCurrency); }
+            get { return _currencies.Sum(x => x.Value.ValueInAccountCurrency); }
         }
 
         /// <summary>
@@ -49,8 +51,8 @@ namespace QuantConnect.Securities
         /// </summary>
         public CashBook()
         {
-            _currencies = new Dictionary<string, Cash>();
-            _currencies.Add(AccountCurrency, new Cash(AccountCurrency, 0, 1.0m));
+            _currencies = new ConcurrentDictionary<string, Cash>();
+            _currencies.AddOrUpdate(AccountCurrency, new Cash(AccountCurrency, 0, 1.0m));
         }
 
         /// <summary>
@@ -63,7 +65,7 @@ namespace QuantConnect.Securities
         public void Add(string symbol, decimal quantity, decimal conversionRate)
         {
             var cash = new Cash(symbol, quantity, conversionRate);
-            _currencies.Add(symbol, cash);
+            _currencies.AddOrUpdate(symbol, cash);
         }
 
         /// <summary>
@@ -75,12 +77,14 @@ namespace QuantConnect.Securities
         /// <param name="symbolPropertiesDatabase">A symbol properties database instance</param>
         /// <param name="marketMap">The market map that decides which market the new security should be in</param>
         /// <returns>Returns a list of added currency securities</returns>
-        public List<Security> EnsureCurrencyDataFeeds(SecurityManager securities, SubscriptionManager subscriptions, MarketHoursDatabase marketHoursDatabase, SymbolPropertiesDatabase symbolPropertiesDatabase, IReadOnlyDictionary<SecurityType, string> marketMap)
+        public List<Security> EnsureCurrencyDataFeeds(SecurityManager securities, SubscriptionManager subscriptions, MarketHoursDatabase marketHoursDatabase, SymbolPropertiesDatabase symbolPropertiesDatabase, IReadOnlyDictionary<SecurityType, string> marketMap, SecurityChanges changes)
         {
             var addedSecurities = new List<Security>();
-            foreach (var cash in _currencies.Values)
+            foreach (var kvp in _currencies)
             {
-                var security = cash.EnsureCurrencyDataFeed(securities, subscriptions, marketHoursDatabase, symbolPropertiesDatabase, marketMap, this);
+                var cash = kvp.Value;
+
+                var security = cash.EnsureCurrencyDataFeed(securities, subscriptions, marketHoursDatabase, symbolPropertiesDatabase, marketMap, this, changes);
                 if (security != null)
                 {
                     addedSecurities.Add(security);
@@ -100,8 +104,19 @@ namespace QuantConnect.Securities
         {
             var source = this[sourceCurrency];
             var destination = this[destinationCurrency];
-            var conversionRate = source.ConversionRate*destination.ConversionRate;
-            return sourceQuantity*conversionRate;
+
+            if (source.ConversionRate == 0)
+            {
+                throw new Exception($"The conversion rate for {sourceCurrency} is not available.");
+            }
+
+            if (destination.ConversionRate == 0)
+            {
+                throw new Exception($"The conversion rate for {destinationCurrency} is not available.");
+            }
+
+            var conversionRate = source.ConversionRate / destination.ConversionRate;
+            return sourceQuantity * conversionRate;
         }
 
         /// <summary>
@@ -126,13 +141,13 @@ namespace QuantConnect.Securities
         {
             var sb = new StringBuilder();
             sb.AppendLine(string.Format("{0} {1,13}    {2,10} = {3}", "Symbol", "Quantity", "Conversion", "Value in " + AccountCurrency));
-            foreach (var value in Values)
+            foreach (var value in _currencies.Select(x => x.Value))
             {
                 sb.AppendLine(value.ToString());
             }
             sb.AppendLine("-------------------------------------------------");
-            sb.AppendLine(string.Format("CashBook Total Value:                {0}{1}", 
-                Currencies.CurrencySymbols[AccountCurrency], 
+            sb.AppendLine(string.Format("CashBook Total Value:                {0}{1}",
+                Currencies.GetCurrencySymbol(AccountCurrency),
                 Math.Round(TotalValueInAccountCurrency, 2))
                 );
 
@@ -145,10 +160,7 @@ namespace QuantConnect.Securities
         /// Gets the count of Cash items in this CashBook.
         /// </summary>
         /// <value>The count.</value>
-        public int Count
-        {
-            get { return _currencies.Count; }
-        }
+        public int Count => _currencies.Skip(0).Count();
 
         /// <summary>
         /// Gets a value indicating whether this instance is read only.
@@ -165,7 +177,7 @@ namespace QuantConnect.Securities
         /// <param name="item">KeyValuePair of symbol -> Cash item</param>
         public void Add(KeyValuePair<string, Cash> item)
         {
-            _currencies.Add(item.Key, item.Value);
+            _currencies.AddOrUpdate(item.Key, item.Value);
         }
 
         /// <summary>
@@ -175,7 +187,7 @@ namespace QuantConnect.Securities
         /// <param name="value">Value.</param>
         public void Add(string symbol, Cash value)
         {
-            _currencies.Add(symbol, value);
+            _currencies.AddOrUpdate(symbol, value);
         }
 
         /// <summary>
@@ -192,7 +204,13 @@ namespace QuantConnect.Securities
         /// <param name="symbol">The symbolto be removed</param>
         public bool Remove(string symbol)
         {
-            return _currencies.Remove (symbol);
+            Cash cash = null;
+            var removed = _currencies.TryRemove(symbol, out cash);
+            if (!removed)
+            {
+                Log.Error(string.Format("CashBook.Remove(): Failed to remove the cash book record for symbol {0}", symbol));
+            }
+            return removed;
         }
 
         /// <summary>
@@ -201,7 +219,13 @@ namespace QuantConnect.Securities
         /// <param name="item">Item.</param>
         public bool Remove(KeyValuePair<string, Cash> item)
         {
-            return _currencies.Remove(item.Key);
+            Cash cash = null;
+            var removed = _currencies.TryRemove(item.Key, out cash);
+            if (!removed)
+            {
+                Log.Error(string.Format("CashBook.Remove(): Failed to remove the cash book record for symbol {0} - {1}", item.Key, item.Value != null ? item.Value.ToString() : "(null)"));
+            }
+            return removed;
         }
 
         /// <summary>
@@ -260,26 +284,23 @@ namespace QuantConnect.Securities
                 }
                 return cash;
             }
-            set { _currencies[symbol] = value; }
+            set
+            {
+                _currencies[symbol] = value;
+            }
         }
 
         /// <summary>
         /// Gets the keys.
         /// </summary>
         /// <value>The keys.</value>
-        public ICollection<string> Keys
-        {
-            get { return _currencies.Keys; }
-        }
+        public ICollection<string> Keys => _currencies.Select(x => x.Key).ToList();
 
         /// <summary>
         /// Gets the values.
         /// </summary>
         /// <value>The values.</value>
-        public ICollection<Cash> Values
-        {
-            get { return _currencies.Values; }
-        }
+        public ICollection<Cash> Values => _currencies.Select(x => x.Value).ToList();
 
         /// <summary>
         /// Gets the enumerator.

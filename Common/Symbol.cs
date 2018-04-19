@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -46,26 +46,37 @@ namespace QuantConnect
         public static Symbol Create(string ticker, SecurityType securityType, string market, string alias = null)
         {
             SecurityIdentifier sid;
+
             switch (securityType)
             {
                 case SecurityType.Base:
                     sid = SecurityIdentifier.GenerateBase(ticker, market);
                     break;
+
                 case SecurityType.Equity:
                     sid = SecurityIdentifier.GenerateEquity(ticker, market);
                     break;
+
                 case SecurityType.Forex:
                     sid = SecurityIdentifier.GenerateForex(ticker, market);
                     break;
+
                 case SecurityType.Cfd:
                     sid = SecurityIdentifier.GenerateCfd(ticker, market);
                     break;
+
                 case SecurityType.Option:
-                    alias = alias ?? "?" + ticker.ToUpper();
-                    sid = SecurityIdentifier.GenerateOption(SecurityIdentifier.DefaultDate, ticker, market, 0, default(OptionRight), default(OptionStyle));
-                    break;
-                case SecurityType.Commodity:
+                    return CreateOption(ticker, market, default(OptionStyle), default(OptionRight), 0, SecurityIdentifier.DefaultDate);
+
                 case SecurityType.Future:
+                    sid = SecurityIdentifier.GenerateFuture(SecurityIdentifier.DefaultDate, ticker, market);
+                    break;
+
+                case SecurityType.Crypto:
+                    sid = SecurityIdentifier.GenerateCrypto(ticker, market);
+                    break;
+
+                case SecurityType.Commodity:
                 default:
                     throw new NotImplementedException("The security type has not been implemented yet: " + securityType);
             }
@@ -82,17 +93,106 @@ namespace QuantConnect
         /// <param name="right">The option right (Put/Call)</param>
         /// <param name="strike">The option strike price</param>
         /// <param name="expiry">The option expiry date</param>
-        /// <param name="alias">An alias to be used for the symbol cache. Required when 
+        /// <param name="alias">An alias to be used for the symbol cache. Required when
+        /// adding the same security from diferent markets</param>
+        /// <param name="mapSymbol">Specifies if symbol should be mapped using map file provider</param>
+        /// <returns>A new Symbol object for the specified option contract</returns>
+        public static Symbol CreateOption(string underlying, string market, OptionStyle style, OptionRight right, decimal strike, DateTime expiry, string alias = null, bool mapSymbol = true)
+        {
+            var underlyingSid = SecurityIdentifier.GenerateEquity(underlying, market, mapSymbol);
+            var underlyingSymbol = new Symbol(underlyingSid, underlying);
+
+            return CreateOption(underlyingSymbol, market, style, right, strike, expiry, alias);
+        }
+
+        /// <summary>
+        /// Provides a convenience method for creating an option Symbol using SecurityIdentifier.
+        /// </summary>
+        /// <param name="underlyingSymbol">The underlying security symbol</param>
+        /// <param name="market">The market the underlying resides in</param>
+        /// <param name="style">The option style (American, European, ect..)</param>
+        /// <param name="right">The option right (Put/Call)</param>
+        /// <param name="strike">The option strike price</param>
+        /// <param name="expiry">The option expiry date</param>
+        /// <param name="alias">An alias to be used for the symbol cache. Required when
         /// adding the same security from diferent markets</param>
         /// <returns>A new Symbol object for the specified option contract</returns>
-        public static Symbol CreateOption(string underlying, string market, OptionStyle style, OptionRight right, decimal strike, DateTime expiry, string alias = null)
+        public static Symbol CreateOption(Symbol underlyingSymbol, string market, OptionStyle style, OptionRight right, decimal strike, DateTime expiry, string alias = null)
         {
-            var sid = SecurityIdentifier.GenerateOption(expiry, underlying, market, strike, right, style);
-            var sym = sid.Symbol;
-            if (sym.Length > 5) sym += " ";
-            // format spec: http://www.optionsclearing.com/components/docs/initiatives/symbology/symbology_initiative_v1_8.pdf
-            alias = alias ?? string.Format("{0,-6}{1}{2}{3:00000000}", sym, sid.Date.ToString(DateFormat.SixCharacter), sid.OptionRight.ToString()[0], sid.StrikePrice * 1000m);
+            var sid = SecurityIdentifier.GenerateOption(expiry, underlyingSymbol.ID, market, strike, right, style);
+
+            if (expiry == SecurityIdentifier.DefaultDate)
+            {
+                alias = alias ?? "?" + underlyingSymbol.Value.ToUpper();
+            }
+            else
+            {
+                var sym = underlyingSymbol.Value;
+                if (sym.Length > 5) sym += " ";
+
+                alias = alias ?? SymbolRepresentation.GenerateOptionTickerOSI(sym, sid.OptionRight, sid.StrikePrice, sid.Date);
+            }
+
+            return new Symbol(sid, alias, underlyingSymbol);
+        }
+
+        /// <summary>
+        /// Provides a convenience method for creating a future Symbol.
+        /// </summary>
+        /// <param name="ticker">The ticker</param>
+        /// <param name="market">The market the future resides in</param>
+        /// <param name="expiry">The future expiry date</param>
+        /// <param name="alias">An alias to be used for the symbol cache. Required when
+        /// adding the same security from different markets</param>
+        /// <returns>A new Symbol object for the specified future contract</returns>
+        public static Symbol CreateFuture(string ticker, string market, DateTime expiry, string alias = null)
+        {
+            var sid = SecurityIdentifier.GenerateFuture(expiry, ticker, market);
+
+            if (expiry == SecurityIdentifier.DefaultDate)
+            {
+                alias = alias ?? "/" + ticker.ToUpper();
+            }
+            else
+            {
+                var sym = sid.Symbol;
+                alias = alias ?? SymbolRepresentation.GenerateFutureTicker(sym, sid.Date);
+            }
+
             return new Symbol(sid, alias);
+        }
+
+        /// <summary>
+        /// Method returns true, if symbol is a derivative canonical symbol
+        /// </summary>
+        /// <returns>true, if symbol is a derivative canonical symbol</returns>
+        public bool IsCanonical()
+        {
+            return
+                (ID.SecurityType == SecurityType.Future ||
+                (ID.SecurityType == SecurityType.Option && HasUnderlying)) &&
+                ID.Date == SecurityIdentifier.DefaultDate;
+        }
+
+        /// <summary>
+        /// Determines if the specified <paramref name="symbol"/> is an underlying of this symbol instance
+        /// </summary>
+        /// <param name="symbol">The underlying to check for</param>
+        /// <returns>True if the specified <paramref name="symbol"/> is an underlying of this symbol instance</returns>
+        public bool HasUnderlyingSymbol(Symbol symbol)
+        {
+            var current = this;
+            while (current.HasUnderlying)
+            {
+                if (current.Underlying == symbol)
+                {
+                    return true;
+                }
+
+                current = current.Underlying;
+            }
+
+            return false;
         }
 
         #region Properties
@@ -106,6 +206,30 @@ namespace QuantConnect
         /// Gets the security identifier for this symbol
         /// </summary>
         public SecurityIdentifier ID { get; private set; }
+
+        /// <summary>
+        /// Gets whether or not this <see cref="Symbol"/> is a derivative,
+        /// that is, it has a valid <see cref="Underlying"/> property
+        /// </summary>
+        public bool HasUnderlying
+        {
+            get { return !ReferenceEquals(Underlying, null); }
+        }
+
+        /// <summary>
+        /// Gets the security underlying symbol, if any
+        /// </summary>
+        public Symbol Underlying { get; private set; }
+
+
+        /// <summary>
+        /// Gets the security type of the symbol
+        /// </summary>
+        public SecurityType SecurityType
+        {
+            get { return ID.SecurityType; }
+        }
+
 
         #endregion
 
@@ -124,6 +248,49 @@ namespace QuantConnect
             }
             ID = sid;
             Value = value.ToUpper();
+        }
+
+        /// <summary>
+        /// Creates new symbol with updated mapped symbol. Symbol Mapping: When symbols change over time (e.g. CHASE-> JPM) need to update the symbol requested.
+        /// Method returns newly created symbol
+        /// </summary>
+        public Symbol UpdateMappedSymbol(string mappedSymbol)
+        {
+            if (ID.SecurityType == SecurityType.Option)
+            {
+                var underlyingSymbol = new Symbol(Underlying.ID, mappedSymbol, null);
+
+                var alias = Value;
+
+                if (ID.Date != SecurityIdentifier.DefaultDate)
+                {
+                    var sym = mappedSymbol;
+                    alias = SymbolRepresentation.GenerateOptionTickerOSI(sym, ID.OptionRight, ID.StrikePrice, ID.Date);
+                }
+
+                return new Symbol(ID, alias, underlyingSymbol);
+            }
+            else
+            {
+                return new Symbol(ID, mappedSymbol, Underlying);
+            }
+        }
+
+        /// <summary>
+        /// Private constructor initializes a new instance of the <see cref="Symbol"/> class with underlying
+        /// </summary>
+        /// <param name="sid">The security identifier for this symbol</param>
+        /// <param name="value">The current ticker symbol value</param>
+        /// <param name="underlying">The underlying symbol</param>
+        internal Symbol(SecurityIdentifier sid, string value, Symbol underlying)
+        {
+            if (value == null)
+            {
+                throw new ArgumentNullException("value");
+            }
+            ID = sid;
+            Value = value.ToUpper();
+            Underlying = underlying;
         }
 
         #endregion
@@ -152,7 +319,7 @@ namespace QuantConnect
                     return ID.Equals(sid);
                 }
             }
-            
+
             // compare a sid just as you would a symbol object
             if (obj is SecurityIdentifier)
             {
@@ -164,7 +331,7 @@ namespace QuantConnect
         }
 
         /// <summary>
-        /// Serves as a hash function for a particular type. 
+        /// Serves as a hash function for a particular type.
         /// </summary>
         /// <returns>
         /// A hash code for the current <see cref="T:System.Object"/>.
@@ -180,7 +347,7 @@ namespace QuantConnect
         /// Compares the current instance with another object of the same type and returns an integer that indicates whether the current instance precedes, follows, or occurs in the same position in the sort order as the other object.
         /// </summary>
         /// <returns>
-        /// A value that indicates the relative order of the objects being compared. The return value has these meanings: Value Meaning Less than zero This instance precedes <paramref name="obj"/> in the sort order. Zero This instance occurs in the same position in the sort order as <paramref name="obj"/>. Greater than zero This instance follows <paramref name="obj"/> in the sort order. 
+        /// A value that indicates the relative order of the objects being compared. The return value has these meanings: Value Meaning Less than zero This instance precedes <paramref name="obj"/> in the sort order. Zero This instance occurs in the same position in the sort order as <paramref name="obj"/>. Greater than zero This instance follows <paramref name="obj"/> in the sort order.
         /// </returns>
         /// <param name="obj">An object to compare with this instance. </param><exception cref="T:System.ArgumentException"><paramref name="obj"/> is not the same type as this instance. </exception><filterpriority>2</filterpriority>
         public int CompareTo(object obj)
@@ -231,27 +398,26 @@ namespace QuantConnect
         }
 
         /// <summary>
-        /// Equals operator 
+        /// Equals operator
         /// </summary>
         /// <param name="left">The left operand</param>
         /// <param name="right">The right operand</param>
         /// <returns>True if both symbols are equal, otherwise false</returns>
         public static bool operator ==(Symbol left, Symbol right)
         {
-            if (ReferenceEquals(left, null)) return ReferenceEquals(right, null);
+            if (ReferenceEquals(left, null) || left.Equals(Empty)) return ReferenceEquals(right, null) || right.Equals(Empty);
             return left.Equals(right);
         }
 
         /// <summary>
-        /// Not equals operator 
+        /// Not equals operator
         /// </summary>
         /// <param name="left">The left operand</param>
         /// <param name="right">The right operand</param>
         /// <returns>True if both symbols are not equal, otherwise false</returns>
         public static bool operator !=(Symbol left, Symbol right)
         {
-            if (ReferenceEquals(left, null)) return ReferenceEquals(right, null);
-            return !left.Equals(right);
+            return !(left == right);
         }
 
         #endregion
@@ -288,7 +454,7 @@ namespace QuantConnect
             {
                 return new Symbol(sid, sid.Symbol);
             }
-            
+
             return Empty;
         }
 

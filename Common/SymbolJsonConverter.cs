@@ -1,11 +1,11 @@
 ﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
- * 
- * Licensed under the Apache License, Version 2.0 (the "License"); 
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -17,12 +17,11 @@
 using System;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using QuantConnect.Securities;
 
 namespace QuantConnect
 {
     /// <summary>
-    /// Defines a <see cref="JsonConverter"/> to be used when deserializing to 
+    /// Defines a <see cref="JsonConverter"/> to be used when deserializing to
     /// the <see cref="Symbol"/> class.
     /// </summary>
     public class SymbolJsonConverter : JsonConverter
@@ -34,7 +33,7 @@ namespace QuantConnect
         public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer)
         {
             var symbol = value as Symbol;
-            if (symbol == null) return;
+            if (ReferenceEquals(symbol, null)) return;
 
             writer.WriteStartObject();
             writer.WritePropertyName("$type");
@@ -45,6 +44,11 @@ namespace QuantConnect
             writer.WriteValue(symbol.ID.ToString());
             writer.WritePropertyName("Permtick");
             writer.WriteValue(symbol.Value);
+            if (symbol.HasUnderlying)
+            {
+                writer.WritePropertyName("Underlying");
+                WriteJson(writer, symbol.Underlying, serializer);
+            }
             writer.WriteEndObject();
         }
 
@@ -58,7 +62,23 @@ namespace QuantConnect
         public override object ReadJson(JsonReader reader, Type objectType, object existingValue, JsonSerializer serializer)
         {
             var jobject = JObject.Load(reader);
-            return new Symbol(SecurityIdentifier.Parse(jobject["ID"].ToString()), jobject["Value"].ToString());
+
+            JToken underlying;
+            Symbol underlyingSymbol = null;
+
+            if (jobject.TryGetValue("Underlying", out underlying))
+            {
+                underlyingSymbol = new Symbol(SecurityIdentifier.Parse(underlying["ID"].ToString()), underlying["Value"].ToString());
+            }
+
+            var symbolId = jobject["ID"];
+
+            if (symbolId == null)
+            {
+                return null;
+            }
+
+            return new Symbol(SecurityIdentifier.Parse(symbolId.ToString()), jobject["Value"].ToString(), underlyingSymbol);
         }
 
         /// <summary>
